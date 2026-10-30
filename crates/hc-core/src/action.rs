@@ -296,6 +296,20 @@ actions! {
         amount: String,
         time: u64,
     },
+    /// Opens a vault led by the signer with its first deposit (µUSDC).
+    /// `nonce` must equal the transaction's; the vault's address comes from it.
+    CreateVault {
+        name: String,
+        description: String,
+        initial_usd: u64,
+        nonce: u64,
+    },
+    /// Deposits µUSDC into a vault, or withdraws that much from the signer's share.
+    VaultTransfer {
+        vault_address: Address,
+        is_deposit: bool,
+        usd: u64,
+    },
 }
 
 impl Action {
@@ -331,6 +345,12 @@ pub struct SignedTx {
     pub nonce: u64,
     /// `r || s || v` with `v` in {27, 28}; the signer is recovered from it.
     pub signature: Sig,
+    /// Trading for a vault the signer leads. Part of the signed hash.
+    #[serde(default, rename = "vaultAddress")]
+    pub vault_address: Option<Address>,
+    /// Rejected once block time passes this (ms). Part of the signed hash.
+    #[serde(default, rename = "expiresAfter")]
+    pub expires_after: Option<u64>,
 }
 
 /// MessagePack of a JSON value, as Hyperliquid's SDKs pack actions: maps
@@ -413,14 +433,30 @@ pub fn msgpack(v: &serde_json::Value, out: &mut Vec<u8>) {
     }
 }
 
-/// Hyperliquid's action hash: `keccak256(msgpack(action) || nonce_be64 || 0x00)`
-/// (the last byte: no vault).
-pub fn action_hash(action: &Action, nonce: u64) -> [u8; 32] {
+/// Hyperliquid's action hash: `keccak256(msgpack(action) || nonce_be64 ||
+/// vault || expiry)`, where `vault` is `0x00`, or `0x01` and the vault
+/// address, and `expiry` is empty, or `0x00` and `expiresAfter` (big-endian).
+pub fn action_hash_full(action: &Action, nonce: u64, vault: Option<Address>, expires_after: Option<u64>) -> [u8; 32] {
     let mut buf = Vec::with_capacity(256);
     msgpack(&serde_json::to_value(action).expect("action encodes"), &mut buf);
     buf.extend_from_slice(&nonce.to_be_bytes());
-    buf.push(0);
+    match vault {
+        Some(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.0);
+        }
+        None => buf.push(0),
+    }
+    if let Some(t) = expires_after {
+        buf.push(0);
+        buf.extend_from_slice(&t.to_be_bytes());
+    }
     keccak256(&buf)
+}
+
+/// The action hash with no vault and no expiry.
+pub fn action_hash(action: &Action, nonce: u64) -> [u8; 32] {
+    action_hash_full(action, nonce, None, None)
 }
 
 /// EIP-712 `source` of the phantom agent: `"a"` on Hyperliquid mainnet,
@@ -498,29 +534,42 @@ pub fn user_signed_hash(action: &Action) -> Option<[u8; 32]> {
 }
 
 /// What a transaction's signature covers: the user-signed digest for
-/// user-signed actions, else the L1 action digest.
-pub fn tx_digest(action: &Action, nonce: u64) -> [u8; 32] {
-    user_signed_hash(action).unwrap_or_else(|| signing_hash(action, nonce))
+/// user-signed actions, else the L1 action digest (with the vault and expiry).
+pub fn tx_digest(action: &Action, nonce: u64, vault: Option<Address>, expires_after: Option<u64>) -> [u8; 32] {
+    user_signed_hash(action).unwrap_or_else(|| l1_digest(&action_hash_full(action, nonce, vault, expires_after)))
 }
 
 /// The digest the signer signs: EIP-712 typed data of the phantom agent
-/// `Agent{source, connectionId: action_hash}`.
+/// `Agent{source, connectionId: action_hash}` (no vault, no expiry).
 pub fn signing_hash(action: &Action, nonce: u64) -> [u8; 32] {
+    l1_digest(&action_hash(action, nonce))
+}
+
+fn l1_digest(connection_id: &[u8; 32]) -> [u8; 32] {
     let mut agent = Vec::with_capacity(96);
     agent.extend_from_slice(&keccak256(b"Agent(string source,bytes32 connectionId)"));
     agent.extend_from_slice(&keccak256(AGENT_SOURCE.as_bytes()));
-    agent.extend_from_slice(&action_hash(action, nonce));
+    agent.extend_from_slice(connection_id);
     eip712_digest(&domain_separator(), &keccak256(&agent))
 }
 
 impl SignedTx {
     pub fn sign(key: &SigningKey, action: Action, nonce: u64) -> SignedTx {
-        let msg = tx_digest(&action, nonce);
+        SignedTx::sign_with(key, action, nonce, None, None)
+    }
+
+    /// Signs for a vault the key leads, and/or with an expiry.
+    pub fn sign_with(key: &SigningKey, action: Action, nonce: u64, vault_address: Option<Address>, expires_after: Option<u64>) -> SignedTx {
+        let msg = tx_digest(&action, nonce, vault_address, expires_after);
         let (sig, rid) = key.sign_prehash_recoverable(&msg).expect("signing succeeds");
         let mut bytes = [0u8; 65];
         bytes[..64].copy_from_slice(&sig.to_bytes());
         bytes[64] = 27 + rid.to_byte();
-        SignedTx { action, nonce, signature: Sig(bytes) }
+        SignedTx { action, nonce, signature: Sig(bytes), vault_address, expires_after }
+    }
+
+    fn digest(&self) -> [u8; 32] {
+        tx_digest(&self.action, self.nonce, self.vault_address, self.expires_after)
     }
 
     /// Recovers the signer's address; `None` if the signature is invalid.
@@ -537,7 +586,7 @@ impl SignedTx {
             return None;
         }
         let sig = RecoverableSignature::from_compact(&bytes[..64], rid).ok()?;
-        let msg = secp256k1::Message::from_digest(tx_digest(&self.action, self.nonce));
+        let msg = secp256k1::Message::from_digest(self.digest());
         let pk = secp256k1::SECP256K1.recover_ecdsa(&msg, &sig).ok()?;
         let h = keccak256(&pk.serialize_uncompressed()[1..]);
         let mut a = [0u8; 20];
@@ -549,7 +598,7 @@ impl SignedTx {
     pub fn signer_k256(&self) -> Option<Address> {
         let sig = Signature::from_slice(&self.signature.0[..64]).ok()?;
         let rid = RecoveryId::from_byte(self.signature.0[64].checked_sub(27)?)?;
-        let vk = VerifyingKey::recover_from_prehash(&tx_digest(&self.action, self.nonce), &sig, rid).ok()?;
+        let vk = VerifyingKey::recover_from_prehash(&self.digest(), &sig, rid).ok()?;
         Some(address_of(&vk))
     }
 

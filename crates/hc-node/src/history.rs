@@ -111,8 +111,12 @@ impl TxRecord {
             j["nonce"] = json!(t.nonce);
             j["signature"] = json!(format!("0x{}", hc_core::types::hex_encode(&t.signature.0)));
             // What was signed: the msgpack action hash, wrapped as EIP-712 typed data.
-            j["actionHash"] = json!(format!("0x{}", hc_core::types::hex_encode(&hc_core::action::action_hash(&t.action, t.nonce))));
-            j["eip712Digest"] = json!(format!("0x{}", hc_core::types::hex_encode(&hc_core::action::signing_hash(&t.action, t.nonce))));
+            let action_hash = hc_core::action::action_hash_full(&t.action, t.nonce, t.vault_address, t.expires_after);
+            j["actionHash"] = json!(format!("0x{}", hc_core::types::hex_encode(&action_hash)));
+            j["eip712Digest"] = json!(format!("0x{}", hc_core::types::hex_encode(&hc_core::action::tx_digest(&t.action, t.nonce, t.vault_address, t.expires_after))));
+            j["userSigned"] = json!(hc_core::action::user_signed_hash(&t.action).is_some());
+            j["vaultAddress"] = json!(t.vault_address);
+            j["expiresAfter"] = json!(t.expires_after);
         }
         j
     }
@@ -139,6 +143,8 @@ pub fn action_type(a: &Action) -> &'static str {
         Action::EvmUserModify { .. } => "evmUserModify",
         Action::ApproveAgent { .. } => "approveAgent",
         Action::UsdSend { .. } => "usdSend",
+        Action::CreateVault { .. } => "createVault",
+        Action::VaultTransfer { .. } => "vaultTransfer",
         Action::Faucet { .. } => "faucet",
         Action::SendToEvm { .. } => "sendToEvm",
         Action::SetOracle { .. } => "setOracle",

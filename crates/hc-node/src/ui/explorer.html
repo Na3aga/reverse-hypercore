@@ -156,6 +156,8 @@ function actionSummary(a) {
     case 'twapOrder': return `TWAP ${sideTxt(a.twap.b)} ${a.twap.s} ${coinOf(a.twap.a)} over ${a.twap.m} min${a.twap.r ? ' · reduce-only' : ''}${a.twap.t ? ' · randomized' : ''}`;
     case 'twapCancel': return `Cancel TWAP #${a.t} on ${coinOf(a.a)}`;
     case 'evmUserModify': return `Send EVM transactions to ${a.usingBigBlocks ? 'big blocks (1/min, 30M gas)' : 'small blocks (1/s, 2M gas)'}`;
+    case 'createVault': return `Create vault "${esc(a.name)}" with ${(a.initialUsd / 1e6).toLocaleString()} USDC`;
+    case 'vaultTransfer': return `${a.isDeposit ? 'Deposit' : 'Withdraw'} ${(a.usd / 1e6).toLocaleString()} USDC ${a.isDeposit ? 'into' : 'from'} vault ${addr(a.vaultAddress)}`;
     case 'usdSend': return `Send ${esc(a.amount)} USDC to ${addr(a.destination)} (user-signed, chain ${parseInt(a.signatureChainId)})`;
     case 'approveAgent': return `Approve agent ${addr(a.agentAddress)}${a.agentName ? ` "${esc(a.agentName)}"` : ''} to trade for this account (user-signed, chain ${parseInt(a.signatureChainId)})`;
     case 'faucet': return `Faucet ${a.usd} USDC`;
@@ -182,7 +184,11 @@ function eventLine(e) {
   switch (e.type) {
     case 'order': { const o = e.update.order; return `Order ${o.oid} ${addr(e.user)} ${o.side === 'B' ? '<span class="buy">buy</span>' : '<span class="sell">sell</span>'} ${o.origSz} ${o.coin} @ ${o.limitPx} → <b>${STATUS_TEXT[e.update.status] ?? e.update.status}</b>${e.update.status === 'open' && o.sz !== o.origSz ? ` (${o.sz} left)` : ''}`; }
     case 'fill': { const f = e.fill; return `Fill ${f.crossed ? 'taker' : 'maker'} ${addr(f.user)} ${f.dir} ${f.sz} ${f.coin} @ ${f.px} · fee ${f.fee}${+f.closedPnl ? ' · closed PnL ' + signed(f.closedPnl) : ''}${f.liquidation ? ' · <span class="err">liquidation</span>' : f.adl ? ' · <span class="warn">auto-deleveraged</span>' : ''} <span class="muted">tid ${f.tid}</span>`; }
-    case 'ledger': if (e.kind?.send) return `${+e.usdc >= 0 ? 'Received' : 'Sent'} ${e.usdc.replace('-', '')} USDC ${addr(e.user)} ${+e.usdc >= 0 ? 'from' : 'to'} ${addr(e.kind.send.counterparty)}`;
+    case 'ledger': if (e.kind?.vaultDeposit || e.kind?.vaultWithdraw || e.kind?.vaultProfitShare) {
+        const k = e.kind.vaultDeposit ? ['deposited into', e.kind.vaultDeposit] : e.kind.vaultWithdraw ? ['withdrew from', e.kind.vaultWithdraw] : ['profit share from', e.kind.vaultProfitShare];
+        return `${addr(e.user)} ${k[0]} vault ${addr(k[1].vault)}: ${e.usdc.replace('-', '')} USDC`;
+      }
+      if (e.kind?.send) return `${+e.usdc >= 0 ? 'Received' : 'Sent'} ${e.usdc.replace('-', '')} USDC ${addr(e.user)} ${+e.usdc >= 0 ? 'from' : 'to'} ${addr(e.kind.send.counterparty)}`;
       return `${{ faucet: 'Faucet credit', coreToEvm: 'Bridged core → EVM', evmToCore: 'Bridged EVM → core', isolatedMargin: 'Isolated margin (+ in, − out)' }[e.kind] ?? e.kind} ${e.usdc} USDC ${addr(e.user)}`;
     case 'twap': { const t = e.twap; return `TWAP #${t.twapId} ${addr(t.user)} ${t.side === 'B' ? '<span class="buy">buy</span>' : '<span class="sell">sell</span>'} ${t.sz} ${t.coin} → <b>${t.status}</b> (${t.executedSz} filled${t.avgPx ? ` at ${t.avgPx} avg` : ''})`; }
     case 'funding': return `Funding ${addr(e.user)} ${e.coin} ${signed(e.usdc)} USDC on ${e.szi} (rate ${e.fundingRate})`;
@@ -240,14 +246,16 @@ async function txPage(h) {
     ['Block', `${blk(tx.height)} <span class="muted">${confirmations} block confirmations</span>`], ['Timestamp', `${ago(tx.time)} <span class="muted">(${ts(tx.time)} UTC)</span>`], ['-']];
   let overview, extra = [];
   if (tx.kind === 'core') {
-    overview = kv([...head, ['From (signer)', addr(tx.user) + ` <span class="mono muted">${tx.user}</span>`], ['Action', actionSummary(tx.action)], ['Type', `<span class="pill core">${tx.action.type}</span>`],
+    overview = kv([...head, ['Account', addr(tx.user) + ` <span class="mono muted">${tx.user}</span>`], ['Action', actionSummary(tx.action)], ['Type', `<span class="pill core">${tx.action.type}</span>`],
       x && ['Trades', x.nTrades ? `${x.nTrades} trade${x.nTrades > 1 ? 's' : ''}, ${x.volume} USDC volume` : '<span class="muted">none</span>'],
       x && ['Trading fees', x.nTrades ? `${x.fees} USDC <span class="muted">(taker and maker, all accounts)</span>` : '<span class="muted">0</span>'],
       ['Gas', '<span class="muted">none: core actions pay trading fees only</span>'], ['-'],
       ['Nonce', `<span class="mono">${tx.nonce ?? '—'}</span> <span class="muted">${tx.nonce ? '(' + ts(tx.nonce) + ')' : ''}</span>`],
       ['Action hash', `<span class="mono" title="keccak256(msgpack(action) ‖ nonce ‖ 0x00)">${short(tx.actionHash ?? '', 18)}</span> <span class="muted">keccak256 of the msgpack action, nonce and vault byte</span>`],
-      ['Signed digest', `<span class="mono">${short(tx.eip712Digest ?? '', 18)}</span> <span class="muted">EIP-712 Agent{source: "b", connectionId: action hash}, domain Exchange / chainId 1337</span>`],
-      ['Signature', `<span class="mono">${short(tx.signature ?? '', 18)}</span> <span class="muted">signer recovered from it</span>`]]);
+      ['Signed digest', `<span class="mono">${short(tx.eip712Digest ?? '', 18)}</span> <span class="muted">${tx.userSigned ? 'EIP-712 of the action itself, domain HyperliquidSignTransaction (user-signed)' : 'EIP-712 Agent{source: "b", connectionId: action hash}, domain Exchange / chainId 1337'}</span>`],
+      tx.vaultAddress && ['For vault', `${addr(tx.vaultAddress)} <span class="muted">signed by its leader (vaultAddress is in the signed hash)</span>`],
+      tx.expiresAfter && ['Expires after', `${ts(tx.expiresAfter)} <span class="muted">(rejected if its block is later)</span>`],
+      ['Signature', `<span class="mono">${short(tx.signature ?? '', 18)}</span> <span class="muted">signer recovered from it</span>`]].filter(Boolean));
     const items = actionItems(tx);
     if (items) extra.push(['items', `Orders and results (${(tx.action.orders ?? tx.action.cancels).length})${tx.action.grouping && tx.action.grouping !== 'na' ? ` · grouping ${tx.action.grouping}` : ''}`, items]);
   } else {
@@ -303,7 +311,8 @@ function activityText(x) {
   const d = x.detail;
   switch (x.kind) {
     case 'fill': return `${d.dir} ${d.sz} ${d.coin} @ ${d.px} · fee ${d.fee} · closedPnl ${d.closedPnl}${d.liquidation ? ' · LIQUIDATION' : d.adl ? ' · AUTO-DELEVERAGED' : ''}`;
-    case 'ledger': return d.kind?.send ? `${+d.usdc >= 0 ? 'received from' : 'sent to'} ${addr(d.kind.send.counterparty)} ${d.usdc.replace('-', '')} USDC` : `${d.kind} ${d.usdc} USDC`;
+    case 'ledger': if (d.kind?.vaultDeposit || d.kind?.vaultWithdraw || d.kind?.vaultProfitShare) return `vault ${Object.keys(d.kind)[0].replace('vault', '').toLowerCase()} ${addr(Object.values(d.kind)[0].vault)} ${d.usdc} USDC`;
+      return d.kind?.send ? `${+d.usdc >= 0 ? 'received from' : 'sent to'} ${addr(d.kind.send.counterparty)} ${d.usdc.replace('-', '')} USDC` : `${d.kind} ${d.usdc} USDC`;
     case 'funding': return `funding ${d.coin} ${d.usdc} USDC (rate ${d.fundingRate})`;
     case 'evmTx': return `${txl(d.tx)} → ${addr(d.to ?? d.contractAddress)} value ${wei(d.valueWei)} ${d.success ? '<span class="ok">ok</span>' : '<span class="err">reverted</span>'}`;
     case 'evmTransferIn': return `received ${wei(d.valueWei)} USDC from ${addr(d.from)} in ${txl(d.tx)}`;

@@ -22,6 +22,7 @@ pub mod oracle;
 pub mod risk;
 pub mod tpsl;
 pub mod twap;
+pub mod vault;
 pub mod types;
 
 pub use action::{Action, BlockBody, SignedTx};

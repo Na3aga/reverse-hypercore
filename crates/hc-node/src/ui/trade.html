@@ -220,6 +220,7 @@
           <option value="custom">Private key…</option>
         </select>
         <span class="addr" id="addr"></span>
+        <select id="tradeas" aria-label="Trade as" hidden title="Trade your own account, or a vault you lead"></select>
       </div>
     </div>
     <div class="seg side" role="group" aria-label="Side">
@@ -270,6 +271,7 @@
   <button role="tab" aria-selected="true" data-tab="positions">Positions</button>
   <button role="tab" aria-selected="false" data-tab="orders">Open orders</button>
   <button role="tab" aria-selected="false" data-tab="twap">TWAP <span class="tag" id="twaptag" hidden></span></button>
+  <button role="tab" aria-selected="false" data-tab="vaults">Vaults</button>
   <button role="tab" aria-selected="false" data-tab="fills">Fills</button>
   <button role="tab" aria-selected="false" data-tab="activity">On-chain activity</button>
   <button role="tab" aria-selected="false" data-tab="risk">Risk limits <span class="tag" id="risktag" hidden>halted</span></button>
@@ -564,7 +566,9 @@ function renderTrades(ts) {
 // ---- Account ------------------------------------------------------------------
 async function refreshAccount() {
   if (!S.addr) return;
-  const d = await info({ type: 'explorerAddress', user: S.addr });
+  const d = await info({ type: 'explorerAddress', user: S.vault ?? S.addr });
+  if (!S.vault) syncTradeAs(d.leads);
+  if (S.tab === 'vaults') S.vaultList = await info({ type: 'vaults', user: S.addr });
   if (S.acct?.address !== d.address) { S.myFills.clear(); }
   S.acct = d;
   for (const o of d.openOrders) if (o.isTrigger) S.triggers.set(o.oid, o);
@@ -669,6 +673,8 @@ function renderTabContent() {
     el.innerHTML = fs.length ? `<table><thead><tr><th>Block</th><th>Market</th><th>Direction</th><th>Price</th><th>Size</th><th>Fee</th><th>Closed PnL</th></tr></thead><tbody>${fs.map(({ height, detail: f }) => `
       <tr><td><a href="/explorer#/block/${height}">${height}</a></td><td>${f.coin}</td><td>${f.dir}${f.adl && !f.liquidation ? ' (auto-deleveraged)' : f.liquidation ? ' (liquidation)' : ''}</td><td>${fmt(f.px, 1)}</td><td>${f.sz}</td><td>${f.fee}</td><td class="${+f.closedPnl >= 0 ? 'bid' : 'ask'}">${f.closedPnl}</td></tr>`).join('')}</tbody></table>`
       : '<p class="muted">No fills yet.</p>';
+  } else if (S.tab === 'vaults') {
+    renderVaults(el);
   } else if (S.tab === 'twap') {
     const ts = d.twaps;
     el.innerHTML = ts.length ? `<table><thead><tr><th>Market</th><th>Side</th><th>Filled / size</th><th>Average price</th><th>Slices</th><th>Ends</th><th></th></tr></thead><tbody>${ts.map((t) => `
@@ -688,6 +694,8 @@ function renderTabContent() {
 }
 function describe(a) {
   const d = a.detail;
+  const vk = d.kind?.vaultDeposit ?? d.kind?.vaultWithdraw ?? d.kind?.vaultProfitShare;
+  if (a.kind === 'ledger' && vk) return `${d.kind.vaultDeposit ? 'Deposited into' : d.kind.vaultWithdraw ? 'Withdrew from' : 'Profit share from'} vault ${vk.vault.slice(0, 8)}…: ${d.usdc.replace('-', '')} USDC`;
   if (a.kind === 'ledger' && d.kind?.send) return `${+d.usdc >= 0 ? `Received from ${d.kind.send.counterparty.slice(0, 8)}…` : `Sent to ${d.kind.send.counterparty.slice(0, 8)}…`}: ${d.usdc.replace('-', '')} USDC`;
   if (a.kind === 'ledger') return `${{ faucet: 'Received test USDC', coreToEvm: 'Moved to EVM', evmToCore: 'Moved to core', isolatedMargin: +d.usdc >= 0 ? 'Added isolated margin' : 'Removed isolated margin' }[d.kind] ?? d.kind}: ${d.usdc.replace('-', '')} USDC`;
   if (a.kind === 'twap') return `TWAP ${d.side === 'B' ? 'buy' : 'sell'} ${d.sz} ${d.coin} ${d.status}${d.status === 'activated' ? ` (${d.minutes} min)` : `: ${d.executedSz} filled${d.avgPx ? ` at ${d.avgPx} on average` : ''}`}`;
@@ -785,7 +793,9 @@ async function act(action, label) {
   const userSigned = USER_SIGNED_TYPES[action.type];
   if (userSigned) action = { signatureChainId: '0x66eee', ...action };
   let payload;
-  try { payload = userSigned && S.agent ? await walletSigned(S.addr, action) : await signAction(S.key, action); }
+  // Trading actions go to the vault chosen in "Trade as" (signed with vaultAddress).
+  const forVault = S.vault && TRADING_ACTIONS.has(action.type) ? { vaultAddress: S.vault } : {};
+  try { payload = userSigned && S.agent ? await walletSigned(S.addr, action) : await signAction(S.key, action, undefined, forVault); }
   catch (e) { toast(`${label}: ${e.shortMessage ?? e.message}`, 'err'); return null; }
   const res = await post(payload);
   const ms = Math.round(performance.now() - t0);
@@ -887,6 +897,46 @@ function setSide(s) {
   document.querySelectorAll('.seg.side button').forEach((b) => b.setAttribute('aria-pressed', b.dataset.v === s));
   $('#submit').className = `submit ${s}`; $('#submit').textContent = S.kind === 'twap' ? `Start ${s} TWAP` : `Place ${s} order`;
 }
+// ---- Vaults ---------------------------------------------------------------------------
+// A leader trades a vault by choosing it in "Trade as": trading actions are
+// then signed with vaultAddress, and the panels show the vault's account.
+const TRADING_ACTIONS = new Set(['order', 'cancel', 'cancelByCloid', 'updateLeverage', 'updateIsolatedMargin', 'twapOrder', 'twapCancel']);
+function syncTradeAs(leads) {
+  const sel = $('#tradeas'), key = JSON.stringify(leads);
+  if (sel.dataset.leads === key) return;
+  sel.dataset.leads = key;
+  sel.innerHTML = `<option value="">My account</option>${leads.map((v) => `<option value="${v.vaultAddress}">Vault: ${v.name.replace(/[<&"]/g, '')}</option>`).join('')}`;
+  sel.value = S.vault ?? '';
+  sel.hidden = !leads.length;
+}
+function renderVaults(el) {
+  const vs = S.vaultList ?? [];
+  const usd6 = (v) => Math.round(+v * 1e6);
+  el.innerHTML = `
+    <table><thead><tr><th>Vault</th><th>Leader</th><th>Value (TVL)</th><th>Followers</th><th>Your equity</th><th>Your PnL</th><th>Locked until</th><th></th></tr></thead><tbody>
+    ${vs.length ? vs.map((v) => { const me = v.followerState; return `<tr>
+      <td><a href="/explorer#/address/${v.vaultAddress}">${v.name.replace(/[<&]/g, '')}</a>${v.leader === S.addr ? ' <span class="tag">you lead</span>' : ''}</td>
+      <td>${v.leader.slice(0, 8)}…</td><td>${fmt(v.tvl)}</td><td>${v.followers.length}</td>
+      <td>${me ? fmt(me.vaultEquity) : '—'}</td><td class="${me && +me.pnl >= 0 ? 'bid' : 'ask'}">${me ? fmt(me.pnl) : '—'}</td>
+      <td>${me && me.lockupUntil > Date.now() ? new Date(me.lockupUntil).toLocaleString() : '—'}</td>
+      <td><div class="row" style="justify-content: flex-end;"><input id="vamt-${v.vaultAddress}" type="text" inputmode="decimal" placeholder="USDC" style="width: 90px;">
+        <button class="btn" data-vdep="${v.vaultAddress}">Deposit</button><button class="btn" data-vwd="${v.vaultAddress}">Withdraw</button></div></td></tr>`; }).join('')
+      : '<tr><td colspan="8" class="muted">No vaults yet. Create one below.</td></tr>'}
+    </tbody></table>
+    <div class="row" style="margin-top: 12px;"><input id="vname" type="text" placeholder="New vault name" style="flex: 1;"><input id="vinit" type="text" inputmode="decimal" placeholder="First deposit (min 100 USDC)" style="flex: 1;"><button class="btn" id="vcreate">Create vault</button></div>
+    <p class="muted">A vault is an account you trade for others. Followers' deposits are locked for a day; when they withdraw, the leader receives 10% of their profit, and the leader must keep at least 5% of the vault. Choose the vault in "Trade as" (next to your address) to trade it.</p>`;
+  el.querySelectorAll('[data-vdep],[data-vwd]').forEach((b) => b.onclick = () => {
+    const v = b.dataset.vdep ?? b.dataset.vwd, amt = $(`#vamt-${v}`).value.trim(), dep = !!b.dataset.vdep;
+    if (!(+amt > 0)) { toast('Enter an amount of USDC.', 'err'); return; }
+    act({ type: 'vaultTransfer', vaultAddress: v, isDeposit: dep, usd: usd6(amt) }, `${dep ? 'Deposit' : 'Withdraw'} ${amt} USDC ${dep ? 'into' : 'from'} vault`).then(refreshAccount);
+  });
+  $('#vcreate').onclick = () => {
+    const name = $('#vname').value.trim(), init = $('#vinit').value.trim();
+    if (!name || !(+init >= 100)) { toast('Enter a name and at least 100 USDC.', 'err'); return; }
+    act({ type: 'createVault', name, description: '', initialUsd: usd6(init), nonce: Date.now() }, `Create vault ${name}`).then(refreshAccount);
+  };
+}
+
 // ---- Wallets ------------------------------------------------------------------------
 // Dev wallets and pasted keys sign everything in the page. A browser wallet
 // (MetaMask) works as on Hyperliquid: it signs one user-signed approveAgent
@@ -953,7 +1003,8 @@ async function setWallet(name) {
     if (!key) { $('#wallet').value = 'alice'; key = devKey('alice'); }
     addr = addressOf(key);
   }
-  S.key = key; S.addr = addr; S.agent = agent;
+  S.key = key; S.addr = addr; S.agent = agent; S.vault = null;
+  $('#tradeas').dataset.leads = ''; $('#tradeas').hidden = true;
   $('#addr').textContent = `${S.addr.slice(0, 6)}…${S.addr.slice(-4)}${agent ? ' · agent' : ''}`;
   $('#addr').title = agent ? `${S.addr} (orders signed by agent ${agent})` : S.addr;
   $('#explorerlink').href = `/explorer#/address/${S.addr}`;
@@ -995,6 +1046,11 @@ $('#setlev').onclick = () => act({ type: 'updateLeverage', asset: asset(), isCro
 $('#faucet').onclick = () => act({ type: 'faucet', usd: $('#amt').value.trim() }, `Faucet ${$('#amt').value} USDC`);
 $('#toevm').onclick = () => act({ type: 'sendToEvm', usd: $('#amt').value.trim() }, `Move ${$('#amt').value} USDC to EVM`);
 $('#tocore').onclick = toCore;
+$('#tradeas').onchange = (e) => {
+  S.vault = e.target.value || null;
+  toast(S.vault ? `Trading as vault ${e.target.selectedOptions[0].textContent.replace('Vault: ', '')}` : 'Trading your own account', '', S.vault ? 'Orders are signed with vaultAddress; positions shown are the vault\'s.' : '');
+  refreshAccount();
+};
 $('#sendusd').onclick = () => {
   const to = $('#sendto').value.trim().toLowerCase(), amt = $('#amt').value.trim();
   if (!/^0x[0-9a-f]{40}$/.test(to)) { toast('Enter the recipient as a 0x address (40 hex digits).', 'err'); return; }

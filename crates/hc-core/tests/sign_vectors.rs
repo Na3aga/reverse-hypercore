@@ -46,7 +46,17 @@ fn vectors() -> Vec<SignedTx> {
             time: 1_760_000_000_011,
         },
     ];
-    actions.into_iter().enumerate().map(|(i, a)| SignedTx::sign(&k, a, 1_760_000_000_000 + i as u64)).collect()
+    let vault_actions = vec![
+        Action::CreateVault { name: "trend".into(), description: "BTC trend".into(), initial_usd: 1_000_000_000, nonce: 1_760_000_000_100 },
+        Action::VaultTransfer { vault_address: hc_core::types::Address([0x5a; 20]), is_deposit: true, usd: 250_000_000 },
+    ];
+    let mut txs: Vec<SignedTx> = actions.into_iter().enumerate().map(|(i, a)| SignedTx::sign(&k, a, 1_760_000_000_000 + i as u64)).collect();
+    txs.push(SignedTx::sign(&k, vault_actions[0].clone(), 1_760_000_000_100));
+    txs.push(SignedTx::sign(&k, vault_actions[1].clone(), 1_760_000_000_101));
+    // A leader trading for a vault, with an expiry: both are in the signed hash.
+    let order_ = Action::order(vec![order(0, true, "100000", "0.1", Tif::Ioc)]);
+    txs.push(SignedTx::sign_with(&k, order_, 1_760_000_000_102, Some(hc_core::types::Address([0x5a; 20])), Some(1_760_000_060_000)));
+    txs
 }
 
 #[test]

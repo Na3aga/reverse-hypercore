@@ -150,12 +150,26 @@ pub fn info(shared: &Shared, req: &Value) -> Result<Value, String> {
                 // Agents (API wallets) this account approved, and the account this address signs for if it is an agent.
                 "agents": st.agents.iter().filter(|(_, a)| a.owner == user).map(|(addr, a)| json!({"address": addr, "name": a.name})).collect::<Vec<_>>(),
                 "agentOf": st.agents.get(&user).map(|a| a.owner),
+                // If this address is a vault, its details; and the vaults this address leads.
+                "vault": views::vault(&st, user, None),
+                "leads": st.vaults.iter().filter(|(_, v)| v.leader == user).map(|(a, v)| json!({"vaultAddress": a, "name": v.name})).collect::<Vec<_>>(),
                 "risk": views::risk(&st, user),
                 "evm": {"balanceWei": evm_balance, "nonce": st.evm.nonce(user.0), "isContract": !st.evm.code(user.0).is_empty(), "usingBigBlocks": st.big_block_users.contains(&user)},
                 "activity": activity,
             }))
         }
         Some("supply") => Ok(views::supply(&st)),
+        // {"type":"vaults","user"?}: every vault, with the user's share if given.
+        Some("vaults") => {
+            let user = user_param(req).ok();
+            Ok(Value::Array(st.vaults.keys().filter_map(|a| views::vault(&st, *a, user)).collect()))
+        }
+        // {"type":"vaultDetails","vaultAddress","user"?}
+        Some("vaultDetails") => {
+            let a = req.get("vaultAddress").cloned().ok_or("missing vaultAddress")?;
+            let a: hc_core::types::Address = serde_json::from_value(a).map_err(|e| e.to_string())?;
+            views::vault(&st, a, user_param(req).ok()).ok_or_else(|| "unknown vault".into())
+        }
         Some("twapStates") => Ok(views::twaps(&st, user_param(req)?)),
         Some("candleSnapshot") => {
             // {"type":"candleSnapshot","req":{"coin":"BTC","interval":"1m","startTime":ms,"endTime":ms}}

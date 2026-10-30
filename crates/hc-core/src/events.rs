@@ -23,6 +23,8 @@ pub enum TxResponse {
     Cancel { statuses: Vec<OrderResponse> },
     /// A TWAP order started.
     Twap { twap_id: u64 },
+    /// A vault was created at this address.
+    Vault { vault_address: Address },
     Default,
     Error { error: String },
 }
@@ -110,6 +112,11 @@ pub enum LedgerKind {
     IsolatedMargin,
     /// A usdSend to (negative) or from (positive) `counterparty`.
     Send { counterparty: Address },
+    /// Balance into a vault (negative), out of it (positive), and the
+    /// leader's profit share.
+    VaultDeposit { vault: Address },
+    VaultWithdraw { vault: Address },
+    VaultProfitShare { vault: Address },
 }
 
 /// Summary of an executed EVM transaction.

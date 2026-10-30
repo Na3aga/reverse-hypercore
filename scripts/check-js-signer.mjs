@@ -26,14 +26,15 @@ const dropNulls = (v) => Array.isArray(v) ? v.map(dropNulls)
 
 let fails = 0;
 for (const v of vectors) {
-  const ours = await signAction(pk, v.action, v.nonce);
+  const opts = { vaultAddress: v.vaultAddress, expiresAfter: v.expiresAfter };
+  const ours = await signAction(pk, v.action, v.nonce, opts);
   // approveAgent and usdSend are user-signed (their own EIP-712 message); the rest are L1 actions.
   const userSigned = !!USER_SIGNED_TYPES[v.action.type];
   const sdk = userSigned
     ? await signUserSignedAction({ wallet, action: v.action, types: USER_SIGNED_TYPES[v.action.type] })
-    : await signL1Action({ wallet, action: dropNulls(v.action), nonce: v.nonce, isTestnet: true });
+    : await signL1Action({ wallet, action: dropNulls(v.action), nonce: v.nonce, isTestnet: true, vaultAddress: v.vaultAddress ?? undefined, expiresAfter: v.expiresAfter ?? undefined });
   const sdkSig = `${sdk.r.slice(2).padStart(64, '0')}${sdk.s.slice(2).padStart(64, '0')}${sdk.v.toString(16)}`;
-  const digest = userSigned ? hashTypedData(userSignedTypedData(v.action)) : signingHash(v.action, v.nonce);
+  const digest = userSigned ? hashTypedData(userSignedTypedData(v.action)) : signingHash(v.action, v.nonce, v.vaultAddress, v.expiresAfter);
   const signer = (await recoverAddress({ hash: digest, signature: v.signature })).toLowerCase();
   const checks = {
     'hcsign.js == Rust': ours.signature === v.signature && JSON.stringify(ours.action) === JSON.stringify(v.action),
@@ -44,7 +45,7 @@ for (const v of vectors) {
   if (bad.length) {
     fails++;
     console.error(`MISMATCH ${v.action.type}: ${bad.join(', ')}\n rust ${v.signature}\n js   ${ours.signature}\n sdk  0x${sdkSig}`);
-  } else console.log(`ok  ${v.action.type}${v.action.grouping ? ` (${v.action.grouping})` : ''}`);
+  } else console.log(`ok  ${v.action.type}${v.action.grouping ? ` (${v.action.grouping})` : ''}${v.vaultAddress ? ' for a vault, with expiresAfter' : ''}`);
 }
 console.log(`${vectors.length - fails}/${vectors.length} vectors match all three ways; alice = ${addressOf(pk)}`);
 process.exitCode = fails ? 1 : 0;

@@ -246,6 +246,7 @@ pub fn tx_response(state: &State, r: &TxResponse, szds: &[Option<u32>]) -> Value
         TxResponse::Cancel { statuses } => json!({"status": "ok", "response": {"type": "cancel", "data": {
             "statuses": statuses.iter().map(|s| order_response(state, s, None)).collect::<Vec<_>>()
         }}}),
+        TxResponse::Vault { vault_address } => json!({"status": "ok", "response": {"type": "createVault", "data": vault_address}}),
         TxResponse::Twap { twap_id } => json!({"status": "ok", "response": {"type": "twapOrder", "data": {"status": {"running": {"twapId": twap_id}}}}}),
         TxResponse::Default => json!({"status": "ok", "response": {"type": "default"}}),
         TxResponse::Error { error } => json!({"status": "err", "response": error}),
@@ -355,6 +356,25 @@ pub fn supply(state: &State) -> Value {
             "discrepancy": usd(accounted - state.total_minted),
         })
     })
+}
+
+/// A vault: its account value, shares and followers' equity. With `user`,
+/// also that user's share.
+pub fn vault(state: &State, addr: Address, user: Option<Address>) -> Option<Value> {
+    let v = state.vaults.get(&addr)?;
+    let equity = state.vault_equity(addr);
+    let per_share = |s: u128| Usd(if v.total_shares == 0 { 0 } else { (s as i128 * equity.0 as i128 / v.total_shares as i128) as i64 });
+    let follower = |a: &Address, f: &hc_core::vault::Follower| {
+        json!({"user": a, "vaultEquity": usd(per_share(f.shares)), "deposited": usd(Usd(f.cost)), "pnl": usd(per_share(f.shares) - Usd(f.cost)), "lockupUntil": f.locked_until, "isLeader": *a == v.leader})
+    };
+    let withdrawable = state.with_margin_ctx(|ctx| state.users.get(&addr).map(|u| u.withdrawable(ctx)).unwrap_or_default());
+    Some(json!({
+        "vaultAddress": addr, "name": v.name, "description": v.description, "leader": v.leader,
+        "createdAt": v.created_ms, "tvl": usd(equity), "withdrawable": usd(withdrawable),
+        "followers": v.followers.iter().map(|(a, f)| follower(a, f)).collect::<Vec<_>>(),
+        "leaderShare": format!("{:.4}", v.followers.get(&v.leader).map_or(0.0, |f| f.shares as f64 / v.total_shares.max(1) as f64)),
+        "followerState": user.and_then(|u| v.followers.get(&u).map(|f| follower(&u, f))),
+    }))
 }
 
 /// A TWAP's progress, in the shape of the public `twapState`.

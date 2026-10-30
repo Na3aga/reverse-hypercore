@@ -152,6 +152,8 @@ pub struct State {
     pub core_writer_queue: std::collections::VecDeque<evm_bridge::DelayedCoreWriter>,
     /// Approved agent (API wallet) -> the account it signs for.
     pub agents: BTreeMap<Address, Agent>,
+    /// Vaults by address (each also has a trading account at that address).
+    pub vaults: BTreeMap<Address, crate::vault::Vault>,
 }
 
 /// An agent key approved by an account (`approveAgent`).
@@ -246,6 +248,7 @@ impl State {
             big_block_users: Default::default(),
             core_writer_queue: Default::default(),
             agents: BTreeMap::new(),
+            vaults: BTreeMap::new(),
         }
     }
 
@@ -477,13 +480,31 @@ impl State {
     /// agent's actions apply to its owner's account. Returns the account the
     /// transaction acted for, and its response.
     fn deliver(&mut self, signer: Address, tx: &SignedTx, events: &mut Vec<Event>, oracle_voted: &mut bool) -> (Address, TxResponse) {
+        if tx.expires_after.is_some_and(|t| self.time_ms > t) {
+            return (signer, TxResponse::err("Action expired."));
+        }
         if let Err(e) = self.check_nonce(signer, tx.nonce) {
             return (signer, TxResponse::err(e));
         }
-        let user = self.agents.get(&signer).map_or(signer, |a| a.owner);
+        let owner = self.agents.get(&signer).map_or(signer, |a| a.owner);
+        // With vaultAddress, the vault's leader (or the leader's agent) trades the vault.
+        let user = match tx.vault_address {
+            None => owner,
+            Some(v) if self.vaults.get(&v).is_some_and(|vault| vault.leader == owner) => {
+                let trading = matches!(
+                    tx.action,
+                    Action::Order { .. } | Action::Cancel { .. } | Action::CancelByCloid { .. } | Action::UpdateLeverage { .. } | Action::UpdateIsolatedMargin { .. } | Action::TwapOrder { .. } | Action::TwapCancel { .. }
+                );
+                if !trading {
+                    return (owner, TxResponse::err("Only trading actions can be sent for a vault."));
+                }
+                v
+            }
+            Some(_) => return (owner, TxResponse::err("Signer is not the leader of this vault.")),
+        };
         let resp = match &tx.action {
             Action::ApproveAgent { .. } if user != signer => TxResponse::err("Agents cannot approve agents."),
-            Action::UsdSend { .. } if user != signer => TxResponse::err("Agents cannot send funds; sign transfers with the account's own key."),
+            Action::UsdSend { .. } | Action::CreateVault { .. } | Action::VaultTransfer { .. } if user != signer => TxResponse::err("Agents and vaults cannot move funds; sign transfers with the account's own key."),
             Action::SetOracle { .. } if user != signer => TxResponse::err("Agents cannot vote for validators."),
             action => self.apply_action(user, tx.nonce, action, events, oracle_voted),
         };
@@ -508,6 +529,8 @@ impl State {
             Action::ApproveAgent { hyperliquid_chain, agent_address, agent_name, nonce: action_nonce, .. } => {
                 self.approve_agent(user, nonce, hyperliquid_chain, *agent_address, agent_name, *action_nonce)
             }
+            Action::CreateVault { name, description, initial_usd, nonce: action_nonce } => self.create_vault(user, nonce, name, description, *initial_usd, *action_nonce, events),
+            Action::VaultTransfer { vault_address, is_deposit, usd } => self.vault_transfer(user, *vault_address, *is_deposit, *usd, events),
             Action::UsdSend { hyperliquid_chain, destination, amount, time, .. } => self.usd_send(user, nonce, hyperliquid_chain, destination, amount, *time, events),
             Action::EvmUserModify { using_big_blocks } => {
                 if *using_big_blocks {

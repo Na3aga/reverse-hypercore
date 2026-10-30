@@ -57,15 +57,19 @@ export function msgpack(v) {
 }
 
 // ---- Hashing and signing ---------------------------------------------------------------
-export function actionHash(action, nonce) {
-  return keccak256(concat([msgpack(action), be(nonce, 8), Uint8Array.of(0)]));
+// keccak256(msgpack(action) || nonce || vault || expiry): vault is 0x00, or
+// 0x01 and the vault address; expiry is empty, or 0x00 and expiresAfter.
+export function actionHash(action, nonce, vaultAddress, expiresAfter) {
+  const vault = vaultAddress ? concat([Uint8Array.of(1), hexToBytes(vaultAddress)]) : Uint8Array.of(0);
+  const expiry = expiresAfter != null ? concat([Uint8Array.of(0), be(expiresAfter, 8)]) : new Uint8Array();
+  return keccak256(concat([msgpack(action), be(nonce, 8), vault, expiry]));
 }
 
 export const DOMAIN = { name: 'Exchange', version: '1', chainId: 1337, verifyingContract: '0x0000000000000000000000000000000000000000' };
 export const AGENT_TYPES = { Agent: [{ name: 'source', type: 'string' }, { name: 'connectionId', type: 'bytes32' }] };
 
-export function signingHash(action, nonce) {
-  return hashTypedData({ domain: DOMAIN, types: AGENT_TYPES, primaryType: 'Agent', message: { source: 'b', connectionId: actionHash(action, nonce) } });
+export function signingHash(action, nonce, vaultAddress, expiresAfter) {
+  return hashTypedData({ domain: DOMAIN, types: AGENT_TYPES, primaryType: 'Agent', message: { source: 'b', connectionId: actionHash(action, nonce, vaultAddress, expiresAfter) } });
 }
 
 // The node's JSON field order for each action (it serializes them this way,
@@ -83,6 +87,8 @@ function canonical(action) {
     case 'twapCancel': return pick(action, ['type', 'a', 't']);
     case 'evmUserModify': return pick(action, ['type', 'usingBigBlocks']);
     case 'approveAgent': return { ...pick(action, ['type', 'signatureChainId', 'hyperliquidChain', 'agentAddress']), agentName: action.agentName ?? '', nonce: action.nonce };
+    case 'createVault': return pick(action, ['type', 'name', 'description', 'initialUsd', 'nonce']);
+    case 'vaultTransfer': return pick(action, ['type', 'vaultAddress', 'isDeposit', 'usd']);
     case 'usdSend': return pick(action, ['type', 'signatureChainId', 'hyperliquidChain', 'destination', 'amount', 'time']);
     case 'faucet': case 'sendToEvm': return pick(action, ['type', 'usd']);
     case 'setOracle': return pick(action, ['type', 'pxs']);
@@ -123,15 +129,18 @@ export function userSignedTypedData(action) {
 }
 
 /** Signs a core action; returns the JSON body for /exchange or a WS post. */
-export async function signAction(privateKey, action, nonce) {
+// `opts.vaultAddress`: trade for a vault the key leads; `opts.expiresAfter`:
+// reject after this time (ms). Both are signed.
+export async function signAction(privateKey, action, nonce, opts = {}) {
   action = canonical(action);
   const userSigned = USER_SIGNED_TYPES[action.type];
-  nonce ??= userSigned ? action[USER_SIGNED_NONCE[action.type]] : Date.now();
-  const hash = userSigned ? hashTypedData(userSignedTypedData(action)) : signingHash(action, nonce);
+  nonce ??= userSigned ? action[USER_SIGNED_NONCE[action.type]] : action.type === 'createVault' ? action.nonce : Date.now();
+  const { vaultAddress = null, expiresAfter = null } = opts;
+  const hash = userSigned ? hashTypedData(userSignedTypedData(action)) : signingHash(action, nonce, vaultAddress, expiresAfter);
   const sig = await sign({ hash, privateKey, to: 'object' });
   const v = Number(sig.v ?? 27n + BigInt(sig.yParity));
   const signature = concat([hexToBytes(sig.r, { size: 32 }), hexToBytes(sig.s, { size: 32 }), Uint8Array.of(v)]);
-  return { action, nonce, signature: toHex(signature) };
+  return { action, nonce, signature: toHex(signature), vaultAddress, expiresAfter };
 }
 
 /** Deterministic devnet key: blake3("hc-dev-key:" + label), as in hc-core. */
