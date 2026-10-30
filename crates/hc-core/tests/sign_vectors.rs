@@ -46,7 +46,7 @@ fn vectors() -> Vec<SignedTx> {
             time: 1_760_000_000_011,
         },
     ];
-    let vault_actions = vec![
+    let vault_actions = [
         Action::CreateVault { name: "trend".into(), description: "BTC trend".into(), initial_usd: 1_000_000_000, nonce: 1_760_000_000_100 },
         Action::VaultTransfer { vault_address: hc_core::types::Address([0x5a; 20]), is_deposit: true, usd: 250_000_000 },
     ];

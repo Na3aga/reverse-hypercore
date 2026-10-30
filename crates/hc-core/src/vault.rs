@@ -64,6 +64,7 @@ impl State {
         self.with_margin_ctx(|ctx| self.users.get(&user).map(|u| u.withdrawable(ctx)).unwrap_or_default())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_vault(&mut self, leader: Address, tx_nonce: u64, name: &str, description: &str, initial_usd: u64, nonce: u64, events: &mut Vec<Event>) -> TxResponse {
         if nonce != tx_nonce {
             return TxResponse::err("Action nonce does not match the transaction nonce.");

@@ -66,6 +66,6 @@ fn an_agent_cannot_send_funds() {
     let thief = key_address(&dev_key("thief"));
     let before = s.users[&a].balance;
     let out = s.apply_block(2, T0 + 2, &[send(&agent_key, thief, "100", T0 + 2)]);
-    assert!(err(&out.responses[0].2).contains("Agents cannot send"));
+    assert!(err(&out.responses[0].2).contains("cannot move funds"));
     assert_eq!(s.users[&a].balance, before);
 }
