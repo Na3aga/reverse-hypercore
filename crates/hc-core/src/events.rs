@@ -108,6 +108,8 @@ pub enum LedgerKind {
     EvmToCore,
     /// Cross balance -> an isolated position's margin (negative: back).
     IsolatedMargin,
+    /// A usdSend to (negative) or from (positive) `counterparty`.
+    Send { counterparty: Address },
 }
 
 /// Summary of an executed EVM transaction.

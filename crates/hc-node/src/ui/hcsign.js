@@ -83,6 +83,7 @@ function canonical(action) {
     case 'twapCancel': return pick(action, ['type', 'a', 't']);
     case 'evmUserModify': return pick(action, ['type', 'usingBigBlocks']);
     case 'approveAgent': return { ...pick(action, ['type', 'signatureChainId', 'hyperliquidChain', 'agentAddress']), agentName: action.agentName ?? '', nonce: action.nonce };
+    case 'usdSend': return pick(action, ['type', 'signatureChainId', 'hyperliquidChain', 'destination', 'amount', 'time']);
     case 'faucet': case 'sendToEvm': return pick(action, ['type', 'usd']);
     case 'setOracle': return pick(action, ['type', 'pxs']);
     case 'setRiskLimits': return pick(action, ['type', 'maxPositionUsd', 'maxLeverage', 'dailyLossUsd', 'closeAtMarginPct']);
@@ -90,28 +91,43 @@ function canonical(action) {
   }
 }
 
-// ---- User-signed actions (approveAgent) ------------------------------------------------
-export const APPROVE_AGENT_TYPES = {
-  'HyperliquidTransaction:ApproveAgent': [
-    { name: 'hyperliquidChain', type: 'string' }, { name: 'agentAddress', type: 'address' },
-    { name: 'agentName', type: 'string' }, { name: 'nonce', type: 'uint64' },
-  ],
+// ---- User-signed actions (approveAgent, usdSend) --------------------------------------
+// Their own fields are the EIP-712 message, in the HyperliquidSignTransaction
+// domain on the chain the wallet is on (signatureChainId).
+export const USER_SIGNED_TYPES = {
+  approveAgent: {
+    'HyperliquidTransaction:ApproveAgent': [
+      { name: 'hyperliquidChain', type: 'string' }, { name: 'agentAddress', type: 'address' },
+      { name: 'agentName', type: 'string' }, { name: 'nonce', type: 'uint64' },
+    ],
+  },
+  usdSend: {
+    'HyperliquidTransaction:UsdSend': [
+      { name: 'hyperliquidChain', type: 'string' }, { name: 'destination', type: 'string' },
+      { name: 'amount', type: 'string' }, { name: 'time', type: 'uint64' },
+    ],
+  },
 };
+/** The nonce field each user-signed action carries; it must equal the transaction nonce. */
+export const USER_SIGNED_NONCE = { approveAgent: 'nonce', usdSend: 'time' };
 
-/** EIP-712 typed data of an approveAgent action, as a wallet signs it. */
-export function approveAgentTypedData(action) {
+/** EIP-712 typed data of a user-signed action, as a wallet signs it (uint64 fields as BigInt). */
+export function userSignedTypedData(action) {
+  const types = USER_SIGNED_TYPES[action.type];
+  const [primaryType] = Object.keys(types);
+  const message = Object.fromEntries(types[primaryType].map(({ name, type }) => [name, type === 'uint64' ? BigInt(action[name]) : action[name] ?? '']));
   return {
     domain: { name: 'HyperliquidSignTransaction', version: '1', chainId: parseInt(action.signatureChainId), verifyingContract: '0x0000000000000000000000000000000000000000' },
-    types: APPROVE_AGENT_TYPES,
-    primaryType: 'HyperliquidTransaction:ApproveAgent',
-    message: { hyperliquidChain: action.hyperliquidChain, agentAddress: action.agentAddress, agentName: action.agentName ?? '', nonce: BigInt(action.nonce) },
+    types, primaryType, message,
   };
 }
 
 /** Signs a core action; returns the JSON body for /exchange or a WS post. */
-export async function signAction(privateKey, action, nonce = Date.now()) {
+export async function signAction(privateKey, action, nonce) {
   action = canonical(action);
-  const hash = action.type === 'approveAgent' ? hashTypedData(approveAgentTypedData(action)) : signingHash(action, nonce);
+  const userSigned = USER_SIGNED_TYPES[action.type];
+  nonce ??= userSigned ? action[USER_SIGNED_NONCE[action.type]] : Date.now();
+  const hash = userSigned ? hashTypedData(userSignedTypedData(action)) : signingHash(action, nonce);
   const sig = await sign({ hash, privateKey, to: 'object' });
   const v = Number(sig.v ?? 27n + BigInt(sig.yParity));
   const signature = concat([hexToBytes(sig.r, { size: 32 }), hexToBytes(sig.s, { size: 32 }), Uint8Array.of(v)]);

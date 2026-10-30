@@ -17,7 +17,7 @@
 //! So a wallet shows a typed-data request, and a Hyperliquid client library
 //! pointed at this node signs valid transactions.
 //!
-//! `approveAgent` is a *user-signed* action instead (Hyperliquid's second
+//! `approveAgent` and `usdSend` are *user-signed* actions instead (Hyperliquid's second
 //! scheme): its own fields are the EIP-712 message
 //! `HyperliquidTransaction:ApproveAgent(string hyperliquidChain, address
 //! agentAddress, string agentName, uint64 nonce)` in the domain
@@ -207,6 +207,8 @@ macro_rules! actions {
     };
 }
 
+// Append new actions at the end: blocks encode an action by its position here,
+// so inserting one would change how existing block logs decode.
 actions! {
     Order {
         orders: Vec<OrderWire>,
@@ -282,6 +284,17 @@ actions! {
         /// Close all positions at market when maintenance margin reaches this
         /// percent of account value (liquidation happens at 100).
         close_at_margin_pct: Option<u32>,
+    },
+    /// Sends USDC from the signer's core balance to `destination` (a 0x
+    /// address). User-signed, like `approveAgent`, so only the account's own
+    /// key can move its funds, never an agent. `time` must equal the
+    /// transaction's nonce.
+    UsdSend {
+        signature_chain_id: String,
+        hyperliquid_chain: String,
+        destination: String,
+        amount: String,
+        time: u64,
     },
 }
 
@@ -454,22 +467,33 @@ fn word_u64(v: u64) -> [u8; 32] {
 /// The EIP-712 digest of a user-signed action, or `None` for L1 actions.
 /// An unparsable `signatureChainId` gives a digest no key signed.
 pub fn user_signed_hash(action: &Action) -> Option<[u8; 32]> {
-    let Action::ApproveAgent { signature_chain_id, hyperliquid_chain, agent_address, agent_name, nonce } = action else { return None };
-    let chain_id = u64::from_str_radix(signature_chain_id.trim_start_matches("0x"), 16).unwrap_or(u64::MAX);
+    // (type string, signature chain id, encoded fields after the type hash)
+    let (ty, chain_id, fields): (&[u8], &str, Vec<[u8; 32]>) = match action {
+        Action::ApproveAgent { signature_chain_id, hyperliquid_chain, agent_address, agent_name, nonce } => {
+            let mut a = [0u8; 32];
+            a[12..].copy_from_slice(&agent_address.0);
+            (
+                b"HyperliquidTransaction:ApproveAgent(string hyperliquidChain,address agentAddress,string agentName,uint64 nonce)",
+                signature_chain_id,
+                vec![keccak256(hyperliquid_chain.as_bytes()), a, keccak256(agent_name.as_bytes()), word_u64(*nonce)],
+            )
+        }
+        Action::UsdSend { signature_chain_id, hyperliquid_chain, destination, amount, time } => (
+            b"HyperliquidTransaction:UsdSend(string hyperliquidChain,string destination,string amount,uint64 time)",
+            signature_chain_id,
+            vec![keccak256(hyperliquid_chain.as_bytes()), keccak256(destination.as_bytes()), keccak256(amount.as_bytes()), word_u64(*time)],
+        ),
+        _ => return None,
+    };
+    let chain_id = u64::from_str_radix(chain_id.trim_start_matches("0x"), 16).unwrap_or(u64::MAX);
     let mut d = Vec::with_capacity(160);
     d.extend_from_slice(&keccak256(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"));
     d.extend_from_slice(&keccak256(b"HyperliquidSignTransaction"));
     d.extend_from_slice(&keccak256(b"1"));
     d.extend_from_slice(&word_u64(chain_id));
     d.extend_from_slice(&[0u8; 32]);
-    let mut s = Vec::with_capacity(160);
-    s.extend_from_slice(&keccak256(b"HyperliquidTransaction:ApproveAgent(string hyperliquidChain,address agentAddress,string agentName,uint64 nonce)"));
-    s.extend_from_slice(&keccak256(hyperliquid_chain.as_bytes()));
-    let mut a = [0u8; 32];
-    a[12..].copy_from_slice(&agent_address.0);
-    s.extend_from_slice(&a);
-    s.extend_from_slice(&keccak256(agent_name.as_bytes()));
-    s.extend_from_slice(&word_u64(*nonce));
+    let mut s = keccak256(ty).to_vec();
+    fields.iter().for_each(|f| s.extend_from_slice(f));
     Some(eip712_digest(&keccak256(&d), &keccak256(&s)))
 }
 

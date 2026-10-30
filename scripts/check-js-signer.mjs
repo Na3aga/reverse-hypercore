@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const work = process.argv[2];
 copyFileSync(join(root, 'crates/hc-node/src/ui/hcsign.js'), join(work, 'hcsign.mjs'));
-const { signAction, devKey, addressOf, signingHash, approveAgentTypedData, APPROVE_AGENT_TYPES } = await import(pathToFileURL(join(work, 'hcsign.mjs')));
+const { signAction, devKey, addressOf, signingHash, userSignedTypedData, USER_SIGNED_TYPES } = await import(pathToFileURL(join(work, 'hcsign.mjs')));
 const { hashTypedData } = await import(pathToFileURL(join(work, 'node_modules/viem/_esm/index.js')));
 const { signL1Action, signUserSignedAction } = await import(pathToFileURL(join(work, 'node_modules/@nktkas/hyperliquid/esm/signing/mod.js')));
 const { privateKeyToAccount } = await import(pathToFileURL(join(work, 'node_modules/viem/_esm/accounts/index.js')));
@@ -27,13 +27,13 @@ const dropNulls = (v) => Array.isArray(v) ? v.map(dropNulls)
 let fails = 0;
 for (const v of vectors) {
   const ours = await signAction(pk, v.action, v.nonce);
-  // approveAgent is user-signed (its own EIP-712 message); everything else is an L1 action.
-  const userSigned = v.action.type === 'approveAgent';
+  // approveAgent and usdSend are user-signed (their own EIP-712 message); the rest are L1 actions.
+  const userSigned = !!USER_SIGNED_TYPES[v.action.type];
   const sdk = userSigned
-    ? await signUserSignedAction({ wallet, action: v.action, types: APPROVE_AGENT_TYPES })
+    ? await signUserSignedAction({ wallet, action: v.action, types: USER_SIGNED_TYPES[v.action.type] })
     : await signL1Action({ wallet, action: dropNulls(v.action), nonce: v.nonce, isTestnet: true });
   const sdkSig = `${sdk.r.slice(2).padStart(64, '0')}${sdk.s.slice(2).padStart(64, '0')}${sdk.v.toString(16)}`;
-  const digest = userSigned ? hashTypedData(approveAgentTypedData(v.action)) : signingHash(v.action, v.nonce);
+  const digest = userSigned ? hashTypedData(userSignedTypedData(v.action)) : signingHash(v.action, v.nonce);
   const signer = (await recoverAddress({ hash: digest, signature: v.signature })).toLowerCase();
   const checks = {
     'hcsign.js == Rust': ours.signature === v.signature && JSON.stringify(ours.action) === JSON.stringify(v.action),

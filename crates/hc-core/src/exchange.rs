@@ -483,6 +483,7 @@ impl State {
         let user = self.agents.get(&signer).map_or(signer, |a| a.owner);
         let resp = match &tx.action {
             Action::ApproveAgent { .. } if user != signer => TxResponse::err("Agents cannot approve agents."),
+            Action::UsdSend { .. } if user != signer => TxResponse::err("Agents cannot send funds; sign transfers with the account's own key."),
             Action::SetOracle { .. } if user != signer => TxResponse::err("Agents cannot vote for validators."),
             action => self.apply_action(user, tx.nonce, action, events, oracle_voted),
         };
@@ -507,6 +508,7 @@ impl State {
             Action::ApproveAgent { hyperliquid_chain, agent_address, agent_name, nonce: action_nonce, .. } => {
                 self.approve_agent(user, nonce, hyperliquid_chain, *agent_address, agent_name, *action_nonce)
             }
+            Action::UsdSend { hyperliquid_chain, destination, amount, time, .. } => self.usd_send(user, nonce, hyperliquid_chain, destination, amount, *time, events),
             Action::EvmUserModify { using_big_blocks } => {
                 if *using_big_blocks {
                     self.big_block_users.insert(user);
@@ -551,6 +553,37 @@ impl State {
             return TxResponse::err(format!("At most {MAX_AGENTS} agents per account."));
         }
         self.agents.insert(agent, Agent { owner: user, name: name.to_string() });
+        TxResponse::Default
+    }
+
+    /// Moves USDC from `user`'s withdrawable balance to `destination`'s balance.
+    #[allow(clippy::too_many_arguments)]
+    fn usd_send(&mut self, user: Address, tx_nonce: u64, chain: &str, destination: &str, amount: &str, time: u64, events: &mut Vec<Event>) -> TxResponse {
+        if chain != crate::action::HYPERLIQUID_CHAIN {
+            return TxResponse::err(format!("Wrong hyperliquidChain {chain:?}; this network is {:?}.", crate::action::HYPERLIQUID_CHAIN));
+        }
+        if time != tx_nonce {
+            return TxResponse::err("Action time does not match the transaction nonce.");
+        }
+        let Some(to) = destination.strip_prefix("0x").and_then(crate::types::hex_decode).and_then(|b| <[u8; 20]>::try_from(b).ok()).map(Address) else {
+            return TxResponse::err("Invalid destination address.");
+        };
+        let Some(v) = parse_decimal(amount, 6).filter(|v| *v > 0).and_then(|v| i64::try_from(v).ok()) else {
+            return TxResponse::err("Invalid amount.");
+        };
+        if to == user {
+            return TxResponse::err("Cannot send to yourself.");
+        }
+        let withdrawable = self.with_margin_ctx(|ctx| self.users.get(&user).map(|u| u.withdrawable(ctx)).unwrap_or_default());
+        if Usd(v) > withdrawable {
+            return TxResponse::err("Insufficient withdrawable balance.");
+        }
+        self.users.entry(user).or_default().balance -= Usd(v);
+        self.users.entry(to).or_default().balance += Usd(v);
+        self.risk_baseline(user, Usd(-v));
+        self.risk_baseline(to, Usd(v));
+        events.push(Event::Ledger { user, kind: LedgerKind::Send { counterparty: to }, usd: Usd(-v) });
+        events.push(Event::Ledger { user: to, kind: LedgerKind::Send { counterparty: user }, usd: Usd(v) });
         TxResponse::Default
     }
 

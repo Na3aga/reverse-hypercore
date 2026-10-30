@@ -183,5 +183,17 @@
     },
     "nonce": 1760000000010,
     "signature": "0xfd521e9cd647b762badeab0c559bcee66a57d8555aa7cb1311377ffea676d90837a705e15174df7afaad9a8cf8df59eebf17f09c863947797a3d7ee3cb2af9551b"
+  },
+  {
+    "action": {
+      "type": "usdSend",
+      "signatureChainId": "0x66eee",
+      "hyperliquidChain": "Testnet",
+      "destination": "0x0000000000000000000000000000000000000abc",
+      "amount": "12.5",
+      "time": 1760000000011
+    },
+    "nonce": 1760000000011,
+    "signature": "0x0d13dad77b2d403dc518931b9277bfb1ac0cb83c51b029353bbb17646bf8ea6334771e1a9b3334cca7893e534d506dc0a01cbb2db4fdd54c77fa2ae7d89472321c"
   }
 ]

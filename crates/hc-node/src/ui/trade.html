@@ -259,6 +259,7 @@
       <div class="row"><label class="f" style="grid-template-columns: 90px 1fr; margin: 0; flex: 1; min-width: 0;">Leverage <input id="lev" type="number" min="1" value="20" style="min-width: 0;"></label><select id="mmode" aria-label="Margin mode" style="width: 96px; flex: none;"><option value="cross">Cross</option><option value="isolated">Isolated</option></select><button class="btn" id="setlev">Set</button></div>
       <div class="row"><input id="amt" type="text" inputmode="decimal" value="1000" aria-label="USDC amount"><button class="btn" id="faucet">Get test USDC</button></div>
       <div class="row"><button class="btn" id="toevm" style="flex: 1;">Move to EVM</button><button class="btn" id="tocore" style="flex: 1;">Move to core</button></div>
+      <div class="row"><input id="sendto" type="text" placeholder="0x… recipient" aria-label="Recipient address" autocomplete="off" style="flex: 1; min-width: 0;"><button class="btn" id="sendusd">Send USDC</button></div>
       <label class="f" title="Small EVM blocks come every second with 2M gas; big ones every minute with 30M gas, for deployments and heavy calls.">Big EVM blocks <input id="bigblocks" type="checkbox" style="justify-self: start;"></label>
       <div class="muted" id="fundsnote">Core and EVM share one address. Moves to EVM settle in the next block; moves to core in the next EVM block (each second).</div>
     </div>
@@ -278,7 +279,7 @@
 <div id="toasts" aria-live="polite"></div>
 
 <script type="module">
-import { signAction, devKey, addressOf, approveAgentTypedData } from '/ui/hcsign.js';
+import { signAction, devKey, addressOf, userSignedTypedData, USER_SIGNED_TYPES, USER_SIGNED_NONCE } from '/ui/hcsign.js';
 import { createWalletClient, http, custom, parseEther, formatEther, defineChain } from 'viem';
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 
@@ -687,6 +688,7 @@ function renderTabContent() {
 }
 function describe(a) {
   const d = a.detail;
+  if (a.kind === 'ledger' && d.kind?.send) return `${+d.usdc >= 0 ? `Received from ${d.kind.send.counterparty.slice(0, 8)}…` : `Sent to ${d.kind.send.counterparty.slice(0, 8)}…`}: ${d.usdc.replace('-', '')} USDC`;
   if (a.kind === 'ledger') return `${{ faucet: 'Received test USDC', coreToEvm: 'Moved to EVM', evmToCore: 'Moved to core', isolatedMargin: +d.usdc >= 0 ? 'Added isolated margin' : 'Removed isolated margin' }[d.kind] ?? d.kind}: ${d.usdc.replace('-', '')} USDC`;
   if (a.kind === 'twap') return `TWAP ${d.side === 'B' ? 'buy' : 'sell'} ${d.sz} ${d.coin} ${d.status}${d.status === 'activated' ? ` (${d.minutes} min)` : `: ${d.executedSz} filled${d.avgPx ? ` at ${d.avgPx} on average` : ''}`}`;
   if (a.kind === 'liquidation') return `${{ market: 'Liquidated at market', backstop: 'Taken over by the liquidator vault', adl: 'Auto-deleveraged (account below zero)' }[d.method] ?? d.method}; account value ${d.accountValue}`;
@@ -778,7 +780,14 @@ async function savePositionTpsl(p, tp, sl, size) {
 async function act(action, label) {
   if (!S.key) { toast('Choose a wallet first.', 'err'); return null; }
   const t0 = performance.now();
-  const res = await post(await signAction(S.key, action));
+  // User-signed actions (transfers) need the account's own key: the browser
+  // wallet when one is connected (the agent may not move funds).
+  const userSigned = USER_SIGNED_TYPES[action.type];
+  if (userSigned) action = { signatureChainId: '0x66eee', ...action };
+  let payload;
+  try { payload = userSigned && S.agent ? await walletSigned(S.addr, action) : await signAction(S.key, action); }
+  catch (e) { toast(`${label}: ${e.shortMessage ?? e.message}`, 'err'); return null; }
+  const res = await post(payload);
   const ms = Math.round(performance.now() - t0);
   if (res.status !== 'ok') { toast(`${label} failed: ${res.response}`, 'err'); return null; }
   const st = res.response.data?.statuses?.[0];
@@ -894,24 +903,30 @@ async function connectBrowserWallet() {
   const acct = await info({ type: 'explorerAddress', user: owner });
   if (agentKey && acct.agents.some((a) => a.address === addressOf(agentKey))) return { owner, agentKey };
   agentKey = generatePrivateKey();
-  const nonce = Date.now();
-  const action = { type: 'approveAgent', signatureChainId: await eth.request({ method: 'eth_chainId' }), hyperliquidChain: 'Testnet', agentAddress: addressOf(agentKey), agentName: AGENT_NAME, nonce };
-  const td = approveAgentTypedData(action);
-  const typed = {
-    ...td,
-    types: { EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }], ...td.types },
-    message: { ...td.message, nonce },
-  };
   toast('Approve trading in your wallet', '', 'One signature lets this browser trade for your account. It cannot send your funds anywhere else.');
-  let sig = await eth.request({ method: 'eth_signTypedData_v4', params: [owner, JSON.stringify(typed)] });
-  // Some wallets return v as 0/1.
-  const v = parseInt(sig.slice(-2), 16);
-  if (v < 27) sig = sig.slice(0, -2) + (v + 27).toString(16);
-  const res = await post({ action, nonce, signature: sig });
+  const res = await post(await walletSigned(owner, { type: 'approveAgent', hyperliquidChain: 'Testnet', agentAddress: addressOf(agentKey), agentName: AGENT_NAME, nonce: Date.now() }));
   if (res.status !== 'ok') throw new Error(res.response);
   localStorage.setItem(keyName, agentKey);
   toast('Trading enabled', 'ok', `agent ${addressOf(agentKey).slice(0, 10)}… approved for ${owner.slice(0, 10)}…`);
   return { owner, agentKey };
+}
+// A user-signed action (approveAgent, usdSend) signed by the browser wallet,
+// on the chain it is connected to; returns the body to post.
+async function walletSigned(owner, action) {
+  const eth = window.ethereum;
+  action = { ...action, signatureChainId: await eth.request({ method: 'eth_chainId' }) };
+  const nonce = action[USER_SIGNED_NONCE[action.type]];
+  const td = userSignedTypedData(action);
+  const typed = {
+    ...td,
+    types: { EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }], ...td.types },
+    message: Object.fromEntries(Object.entries(td.message).map(([k, v]) => [k, typeof v === 'bigint' ? Number(v) : v])),
+  };
+  let signature = await eth.request({ method: 'eth_signTypedData_v4', params: [owner, JSON.stringify(typed)] });
+  // Some wallets return v as 0/1.
+  const v = parseInt(signature.slice(-2), 16);
+  if (v < 27) signature = signature.slice(0, -2) + (v + 27).toString(16);
+  return { action, nonce, signature };
 }
 // EVM transactions: from the browser wallet itself, or from the page's key.
 async function evmWallet() {
@@ -980,6 +995,12 @@ $('#setlev').onclick = () => act({ type: 'updateLeverage', asset: asset(), isCro
 $('#faucet').onclick = () => act({ type: 'faucet', usd: $('#amt').value.trim() }, `Faucet ${$('#amt').value} USDC`);
 $('#toevm').onclick = () => act({ type: 'sendToEvm', usd: $('#amt').value.trim() }, `Move ${$('#amt').value} USDC to EVM`);
 $('#tocore').onclick = toCore;
+$('#sendusd').onclick = () => {
+  const to = $('#sendto').value.trim().toLowerCase(), amt = $('#amt').value.trim();
+  if (!/^0x[0-9a-f]{40}$/.test(to)) { toast('Enter the recipient as a 0x address (40 hex digits).', 'err'); return; }
+  // usdSend is user-signed: its time field is the nonce.
+  act({ type: 'usdSend', hyperliquidChain: 'Testnet', destination: to, amount: amt, time: Date.now() }, `Send ${amt} USDC to ${to.slice(0, 8)}…`);
+};
 $('#bigblocks').onchange = (e) => act({ type: 'evmUserModify', usingBigBlocks: e.target.checked }, e.target.checked ? 'Use big EVM blocks' : 'Use small EVM blocks');
 
 S.meta = await info({ type: 'meta' });

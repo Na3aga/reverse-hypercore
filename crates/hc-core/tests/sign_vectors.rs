@@ -38,6 +38,13 @@ fn vectors() -> Vec<SignedTx> {
             agent_name: "web".into(),
             nonce: 1_760_000_000_010,
         },
+        Action::UsdSend {
+            signature_chain_id: "0x66eee".into(),
+            hyperliquid_chain: hc_core::action::HYPERLIQUID_CHAIN.into(),
+            destination: "0x0000000000000000000000000000000000000abc".into(),
+            amount: "12.5".into(),
+            time: 1_760_000_000_011,
+        },
     ];
     actions.into_iter().enumerate().map(|(i, a)| SignedTx::sign(&k, a, 1_760_000_000_000 + i as u64)).collect()
 }

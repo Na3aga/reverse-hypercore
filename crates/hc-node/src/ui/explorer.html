@@ -156,6 +156,7 @@ function actionSummary(a) {
     case 'twapOrder': return `TWAP ${sideTxt(a.twap.b)} ${a.twap.s} ${coinOf(a.twap.a)} over ${a.twap.m} min${a.twap.r ? ' · reduce-only' : ''}${a.twap.t ? ' · randomized' : ''}`;
     case 'twapCancel': return `Cancel TWAP #${a.t} on ${coinOf(a.a)}`;
     case 'evmUserModify': return `Send EVM transactions to ${a.usingBigBlocks ? 'big blocks (1/min, 30M gas)' : 'small blocks (1/s, 2M gas)'}`;
+    case 'usdSend': return `Send ${esc(a.amount)} USDC to ${addr(a.destination)} (user-signed, chain ${parseInt(a.signatureChainId)})`;
     case 'approveAgent': return `Approve agent ${addr(a.agentAddress)}${a.agentName ? ` "${esc(a.agentName)}"` : ''} to trade for this account (user-signed, chain ${parseInt(a.signatureChainId)})`;
     case 'faucet': return `Faucet ${a.usd} USDC`;
     case 'sendToEvm': return `Bridge ${a.usd} USDC to HyperEVM`;
@@ -181,7 +182,8 @@ function eventLine(e) {
   switch (e.type) {
     case 'order': { const o = e.update.order; return `Order ${o.oid} ${addr(e.user)} ${o.side === 'B' ? '<span class="buy">buy</span>' : '<span class="sell">sell</span>'} ${o.origSz} ${o.coin} @ ${o.limitPx} → <b>${STATUS_TEXT[e.update.status] ?? e.update.status}</b>${e.update.status === 'open' && o.sz !== o.origSz ? ` (${o.sz} left)` : ''}`; }
     case 'fill': { const f = e.fill; return `Fill ${f.crossed ? 'taker' : 'maker'} ${addr(f.user)} ${f.dir} ${f.sz} ${f.coin} @ ${f.px} · fee ${f.fee}${+f.closedPnl ? ' · closed PnL ' + signed(f.closedPnl) : ''}${f.liquidation ? ' · <span class="err">liquidation</span>' : f.adl ? ' · <span class="warn">auto-deleveraged</span>' : ''} <span class="muted">tid ${f.tid}</span>`; }
-    case 'ledger': return `${{ faucet: 'Faucet credit', coreToEvm: 'Bridged core → EVM', evmToCore: 'Bridged EVM → core', isolatedMargin: 'Isolated margin (+ in, − out)' }[e.kind] ?? e.kind} ${e.usdc} USDC ${addr(e.user)}`;
+    case 'ledger': if (e.kind?.send) return `${+e.usdc >= 0 ? 'Received' : 'Sent'} ${e.usdc.replace('-', '')} USDC ${addr(e.user)} ${+e.usdc >= 0 ? 'from' : 'to'} ${addr(e.kind.send.counterparty)}`;
+      return `${{ faucet: 'Faucet credit', coreToEvm: 'Bridged core → EVM', evmToCore: 'Bridged EVM → core', isolatedMargin: 'Isolated margin (+ in, − out)' }[e.kind] ?? e.kind} ${e.usdc} USDC ${addr(e.user)}`;
     case 'twap': { const t = e.twap; return `TWAP #${t.twapId} ${addr(t.user)} ${t.side === 'B' ? '<span class="buy">buy</span>' : '<span class="sell">sell</span>'} ${t.sz} ${t.coin} → <b>${t.status}</b> (${t.executedSz} filled${t.avgPx ? ` at ${t.avgPx} avg` : ''})`; }
     case 'funding': return `Funding ${addr(e.user)} ${e.coin} ${signed(e.usdc)} USDC on ${e.szi} (rate ${e.fundingRate})`;
     case 'liquidation': return `<span class="err">${e.method === 'adl' ? 'Auto-deleveraging' : 'Liquidation'}</span> ${addr(e.user)} (${{ market: 'market orders', backstop: 'backstop vault', adl: 'closed at the bankruptcy price against the top-ranked opposite positions' }[e.method] ?? e.method}) at account value ${e.accountValue}: ${e.positions.map((p) => `${p.szi} ${p.coin}`).join(', ')}`;
@@ -301,7 +303,7 @@ function activityText(x) {
   const d = x.detail;
   switch (x.kind) {
     case 'fill': return `${d.dir} ${d.sz} ${d.coin} @ ${d.px} · fee ${d.fee} · closedPnl ${d.closedPnl}${d.liquidation ? ' · LIQUIDATION' : d.adl ? ' · AUTO-DELEVERAGED' : ''}`;
-    case 'ledger': return `${d.kind} ${d.usdc} USDC`;
+    case 'ledger': return d.kind?.send ? `${+d.usdc >= 0 ? 'received from' : 'sent to'} ${addr(d.kind.send.counterparty)} ${d.usdc.replace('-', '')} USDC` : `${d.kind} ${d.usdc} USDC`;
     case 'funding': return `funding ${d.coin} ${d.usdc} USDC (rate ${d.fundingRate})`;
     case 'evmTx': return `${txl(d.tx)} → ${addr(d.to ?? d.contractAddress)} value ${wei(d.valueWei)} ${d.success ? '<span class="ok">ok</span>' : '<span class="err">reverted</span>'}`;
     case 'evmTransferIn': return `received ${wei(d.valueWei)} USDC from ${addr(d.from)} in ${txl(d.tx)}`;
