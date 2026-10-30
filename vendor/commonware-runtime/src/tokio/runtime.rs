@@ -1,0 +1,1523 @@
+#[cfg(feature = "external")]
+use crate::Pacer;
+#[cfg(not(feature = "iouring-network"))]
+use crate::network::tokio::{Config as TokioNetworkConfig, Network as TokioNetwork};
+#[cfg(feature = "iouring-storage")]
+use crate::storage::iouring::{Config as IoUringConfig, Storage as IoUringStorage};
+#[cfg(not(feature = "iouring-storage"))]
+use crate::storage::tokio::{Config as TokioStorageConfig, Storage as TokioStorage};
+use crate::{
+    BlobLayout, BlobVersion, BufferPool, BufferPoolConfig, Clock, Error, Execution, Handle,
+    METRICS_PREFIX, Name, SinkOf, StreamOf, child_label,
+    network::metered::Network as MeteredNetwork,
+    prefixed_name,
+    process::metered::Metrics as MeteredProcess,
+    signal::Signal,
+    storage::metered::Storage as MeteredStorage,
+    telemetry::metrics::{
+        CounterFamily, GaugeFamily, Metric, Register, Registered, Registry, add_attribute, raw,
+        task::Label, validate_label,
+    },
+    utils::{self, Panicker, signal::Stopper, supervision::Tree},
+};
+#[cfg(feature = "iouring-network")]
+use crate::{
+    iouring,
+    network::iouring::{Config as IoUringNetworkConfig, Network as IoUringNetwork},
+};
+use commonware_macros::{select, stability};
+#[stability(BETA)]
+use commonware_parallel::Rayon;
+use commonware_utils::{NZUsize, sync::Mutex, sys_rng};
+use governor::clock::{Clock as GClock, ReasonablyRealtime};
+use rand_core::{Rng, TryCryptoRng, TryRng};
+#[stability(BETA)]
+use rayon::ThreadPoolBuilder;
+use std::{
+    convert::Infallible,
+    env,
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    num::NonZeroUsize,
+    ops::RangeInclusive,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use tokio::{
+    runtime::{Builder, Handle as RuntimeHandle},
+    sync::Notify,
+};
+
+#[cfg(feature = "iouring-network")]
+cfg_if::cfg_if! {
+    if #[cfg(test)] {
+        // Use a smaller ring in tests to reduce `io_uring_setup` failures
+        // under parallel test load due to mlock/resource limits.
+        const IOURING_NETWORK_SIZE: u32 = 128;
+    } else {
+        const IOURING_NETWORK_SIZE: u32 = 1024;
+    }
+}
+
+#[derive(Debug)]
+struct Metrics {
+    tasks_spawned: CounterFamily<Label>,
+    tasks_running: GaugeFamily<Label>,
+}
+
+impl Metrics {
+    pub fn init(registry: &mut impl Register) -> Self {
+        Self {
+            tasks_spawned: registry.register(
+                "tasks_spawned",
+                "Total number of tasks spawned",
+                raw::Family::default(),
+            ),
+            tasks_running: registry.register(
+                "tasks_running",
+                "Number of tasks currently running",
+                raw::Family::default(),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NetworkConfig {
+    /// If Some, explicitly sets TCP_NODELAY on the socket.
+    /// Otherwise uses system default.
+    ///
+    /// Defaults to `Some(true)`.
+    tcp_nodelay: Option<bool>,
+
+    /// Whether to set `SO_LINGER` to zero on the socket.
+    ///
+    /// When enabled, causes an immediate RST on close, avoiding
+    /// `TIME_WAIT` state. This is useful in adversarial environments to
+    /// reclaim socket resources immediately when closing connections to
+    /// misbehaving peers.
+    ///
+    /// Defaults to `true`.
+    zero_linger: bool,
+
+    /// Timeout for establishing an outbound TCP connection.
+    ///
+    /// Defaults to 10 seconds.
+    connect_timeout: Duration,
+
+    /// Read/write timeout for network operations.
+    ///
+    /// Bounds the full `Sink::send` and `Stream::recv` calls rather than each
+    /// individual socket syscall. Larger batched writes may therefore require a
+    /// larger timeout.
+    ///
+    /// Defaults to 60 seconds.
+    read_write_timeout: Duration,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            tcp_nodelay: Some(true),
+            zero_linger: true,
+            connect_timeout: Duration::from_secs(10),
+            read_write_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Configuration for the `tokio` runtime.
+#[derive(Clone)]
+pub struct Config {
+    /// Number of threads to use for handling async tasks.
+    ///
+    /// Worker threads are always active (waiting for work).
+    ///
+    /// Tokio sets the default value to the number of logical CPUs.
+    worker_threads: usize,
+
+    /// Number of scheduler ticks between global queue polls.
+    ///
+    /// When unset, Tokio uses its default behavior for the multi-thread
+    /// scheduler. Smaller values reduce the delay before tasks woken from
+    /// outside a worker, such as io_uring completion notifications, are polled
+    /// from the global queue again.
+    global_queue_interval: Option<u32>,
+
+    /// Maximum number of threads to use for blocking tasks.
+    ///
+    /// Unlike worker threads, blocking threads are created as needed and
+    /// exit if left idle for too long.
+    ///
+    /// Tokio sets the default value to 512 to avoid hanging on lower-level
+    /// operations that require blocking (like `fs` and writing to `Stdout`).
+    max_blocking_threads: usize,
+
+    /// Stack size to use for runtime-owned threads.
+    ///
+    /// Defaults to the system stack size when the current platform exposes it,
+    /// and otherwise falls back to Rust's default spawned-thread stack size.
+    ///
+    /// See [utils::thread::system_thread_stack_size].
+    thread_stack_size: usize,
+
+    /// Whether or not to catch panics.
+    catch_panics: bool,
+
+    /// Base directory for all storage operations, created at start if missing
+    /// and held for the run.
+    storage_directory: PathBuf,
+
+    /// Blob layouts accepted by storage.
+    ///
+    /// Defaults to [BlobLayout::ALL] and must be non-empty. New blobs use the latest layout in
+    /// the range. Existing blobs outside it fail to open with [Error::BlobLayoutMismatch], so
+    /// restrict the range to what a rollback target can read before the upgraded binary first
+    /// opens storage.
+    storage_blob_layouts: RangeInclusive<BlobLayout>,
+
+    /// Network configuration.
+    network_cfg: NetworkConfig,
+
+    /// Explicit buffer pool configuration for network I/O, if provided.
+    network_buffer_pool_cfg: Option<BufferPoolConfig>,
+
+    /// Explicit buffer pool configuration for storage I/O, if provided.
+    storage_buffer_pool_cfg: Option<BufferPoolConfig>,
+}
+
+impl Config {
+    /// Returns a new [Config] with default values.
+    pub fn new() -> Self {
+        let rng = sys_rng().next_u64();
+        let storage_directory = env::temp_dir().join(format!("commonware_tokio_runtime_{rng}"));
+        Self {
+            worker_threads: 2,
+            global_queue_interval: None,
+            max_blocking_threads: 512,
+            thread_stack_size: utils::thread::system_thread_stack_size(),
+            catch_panics: false,
+            storage_directory,
+            storage_blob_layouts: BlobLayout::ALL,
+            network_cfg: NetworkConfig::default(),
+            network_buffer_pool_cfg: None,
+            storage_buffer_pool_cfg: None,
+        }
+    }
+
+    // Setters
+    /// See [Config]
+    pub const fn with_worker_threads(mut self, n: usize) -> Self {
+        self.worker_threads = n;
+        self
+    }
+    /// See [Config]
+    pub const fn with_global_queue_interval(mut self, n: u32) -> Self {
+        self.global_queue_interval = Some(n);
+        self
+    }
+    /// See [Config]
+    pub const fn with_max_blocking_threads(mut self, n: usize) -> Self {
+        self.max_blocking_threads = n;
+        self
+    }
+    /// See [Config]
+    pub const fn with_thread_stack_size(mut self, n: usize) -> Self {
+        self.thread_stack_size = n;
+        self
+    }
+    /// See [Config]
+    pub const fn with_catch_panics(mut self, b: bool) -> Self {
+        self.catch_panics = b;
+        self
+    }
+    /// See [Config]
+    pub const fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.network_cfg.connect_timeout = timeout;
+        self
+    }
+    /// See [Config]
+    pub const fn with_read_write_timeout(mut self, d: Duration) -> Self {
+        self.network_cfg.read_write_timeout = d;
+        self
+    }
+    /// See [Config]
+    pub const fn with_tcp_nodelay(mut self, n: Option<bool>) -> Self {
+        self.network_cfg.tcp_nodelay = n;
+        self
+    }
+    /// See [Config]
+    pub const fn with_zero_linger(mut self, l: bool) -> Self {
+        self.network_cfg.zero_linger = l;
+        self
+    }
+    /// See [Config]
+    pub fn with_storage_directory(mut self, p: impl Into<PathBuf>) -> Self {
+        self.storage_directory = p.into();
+        self
+    }
+    /// See [Config]
+    ///
+    /// # Panics
+    ///
+    /// Panics if `layouts` is empty.
+    pub fn with_storage_blob_layouts(mut self, layouts: RangeInclusive<BlobLayout>) -> Self {
+        assert!(
+            !layouts.is_empty(),
+            "storage blob layouts must be non-empty"
+        );
+        self.storage_blob_layouts = layouts;
+        self
+    }
+    /// See [Config]
+    pub fn with_network_buffer_pool_config(mut self, cfg: BufferPoolConfig) -> Self {
+        self.network_buffer_pool_cfg = Some(cfg);
+        self
+    }
+    /// See [Config]
+    pub fn with_storage_buffer_pool_config(mut self, cfg: BufferPoolConfig) -> Self {
+        self.storage_buffer_pool_cfg = Some(cfg);
+        self
+    }
+
+    // Getters
+    /// See [Config]
+    pub const fn worker_threads(&self) -> usize {
+        self.worker_threads
+    }
+    /// See [Config]
+    pub const fn global_queue_interval(&self) -> Option<u32> {
+        self.global_queue_interval
+    }
+    /// See [Config]
+    pub const fn max_blocking_threads(&self) -> usize {
+        self.max_blocking_threads
+    }
+    /// See [Config]
+    pub const fn thread_stack_size(&self) -> usize {
+        self.thread_stack_size
+    }
+    /// See [Config]
+    pub const fn catch_panics(&self) -> bool {
+        self.catch_panics
+    }
+    /// See [Config]
+    pub const fn connect_timeout(&self) -> Duration {
+        self.network_cfg.connect_timeout
+    }
+    /// See [Config]
+    pub const fn read_write_timeout(&self) -> Duration {
+        self.network_cfg.read_write_timeout
+    }
+    /// See [Config]
+    pub const fn tcp_nodelay(&self) -> Option<bool> {
+        self.network_cfg.tcp_nodelay
+    }
+    /// See [Config]
+    pub const fn zero_linger(&self) -> bool {
+        self.network_cfg.zero_linger
+    }
+    /// See [Config]
+    pub const fn storage_directory(&self) -> &PathBuf {
+        &self.storage_directory
+    }
+    /// See [Config]
+    pub const fn storage_blob_layouts(&self) -> &RangeInclusive<BlobLayout> {
+        &self.storage_blob_layouts
+    }
+
+    /// Returns the network buffer pool config, deriving pool parallelism from
+    /// `worker_threads` if not explicitly configured.
+    fn resolved_network_buffer_pool_config(&self) -> BufferPoolConfig {
+        self.network_buffer_pool_cfg.clone().unwrap_or_else(|| {
+            BufferPoolConfig::for_network().with_parallelism(NZUsize!(self.worker_threads))
+        })
+    }
+
+    /// Returns the storage buffer pool config, deriving pool parallelism from
+    /// `worker_threads` if not explicitly configured.
+    fn resolved_storage_buffer_pool_config(&self) -> BufferPoolConfig {
+        self.storage_buffer_pool_cfg.clone().unwrap_or_else(|| {
+            BufferPoolConfig::for_storage().with_parallelism(NZUsize!(self.worker_threads))
+        })
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Runtime based on [Tokio](https://tokio.rs).
+pub struct Executor {
+    registry: Registry,
+    metrics: Arc<Metrics>,
+    runtime: RuntimeHandle,
+    tasks: Arc<TaskTracker>,
+    shutdown: Mutex<Stopper>,
+    panicker: Panicker,
+    thread_stack_size: usize,
+}
+
+/// Closes task admission and tracks wrappers through user-future drop and descendant cleanup.
+#[derive(Default)]
+struct TaskTracker {
+    state: Mutex<TaskTrackerState>,
+    idle: Notify,
+}
+
+#[derive(Default)]
+struct TaskTrackerState {
+    active: usize,
+    closed: bool,
+}
+
+impl TaskTracker {
+    fn admit(self: &Arc<Self>) -> Option<TaskGuard> {
+        let mut state = self.state.lock();
+        if state.closed {
+            return None;
+        }
+        state.active = state.active.checked_add(1).expect("active task overflow");
+        Some(TaskGuard(Arc::clone(self)))
+    }
+
+    fn close(&self) {
+        self.state.lock().closed = true;
+    }
+
+    async fn wait(&self) {
+        loop {
+            // Subscribe before checking so the final task cannot notify between the check and wait.
+            let idle = self.idle.notified();
+            if self.state.lock().active == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+struct TaskGuard(Arc<TaskTracker>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock();
+        state.active = state.active.checked_sub(1).expect("active task underflow");
+        if state.active == 0 {
+            drop(state);
+            self.0.idle.notify_one();
+        }
+    }
+}
+
+/// Implementation of [crate::Runner] for the `tokio` runtime.
+pub struct Runner {
+    cfg: Config,
+}
+
+impl Default for Runner {
+    fn default() -> Self {
+        Self::new(Config::default())
+    }
+}
+
+impl Runner {
+    /// Initialize a new `tokio` runtime with the given number of threads.
+    pub const fn new(cfg: Config) -> Self {
+        Self { cfg }
+    }
+}
+
+impl crate::Runner for Runner {
+    type Context = Context;
+
+    fn start<F, Fut>(self, f: F) -> Fut::Output
+    where
+        F: FnOnce(Self::Context) -> Fut,
+        Fut: Future,
+    {
+        // Create a new registry
+        let mut registry = Registry::new();
+        let mut runtime_registry = registry.sub_registry(METRICS_PREFIX);
+
+        // Initialize runtime
+        let metrics = Arc::new(Metrics::init(&mut runtime_registry));
+        let mut builder = Builder::new_multi_thread();
+        builder
+            .worker_threads(self.cfg.worker_threads)
+            .max_blocking_threads(self.cfg.max_blocking_threads)
+            .thread_stack_size(self.cfg.thread_stack_size)
+            .enable_all();
+        if let Some(global_queue_interval) = self.cfg.global_queue_interval {
+            builder.global_queue_interval(global_queue_interval);
+        }
+        let runtime = builder.build().expect("failed to create Tokio runtime");
+
+        // Initialize panicker
+        let (panicker, panicked) = Panicker::new(self.cfg.catch_panics);
+
+        // Collect process metrics.
+        //
+        // We prefer to collect process metrics outside of `Context` because
+        // we are using `runtime_registry` rather than the one provided by `Context`.
+        let process = MeteredProcess::init(&mut runtime_registry);
+        runtime.spawn(process.collect(tokio::time::sleep));
+
+        // Initialize buffer pools
+        let network_buffer_pool = BufferPool::new(
+            self.cfg.resolved_network_buffer_pool_config(),
+            &mut runtime_registry.sub_registry("network_buffer_pool"),
+        );
+        let storage_buffer_pool = BufferPool::new(
+            self.cfg.resolved_storage_buffer_pool_config(),
+            &mut runtime_registry.sub_registry("storage_buffer_pool"),
+        );
+
+        // Initialize storage
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "iouring-storage")] {
+                let mut iouring_registry = runtime_registry.sub_registry("iouring_storage");
+                let storage = MeteredStorage::new(
+                    IoUringStorage::start(
+                        IoUringConfig {
+                            storage_directory: self.cfg.storage_directory.clone(),
+                            blob_layouts: self.cfg.storage_blob_layouts.clone(),
+                            iouring_config: Default::default(),
+                            thread_stack_size: self.cfg.thread_stack_size,
+                        },
+                        &mut iouring_registry,
+                        storage_buffer_pool.clone(),
+                    ),
+                    &mut runtime_registry,
+                );
+            } else {
+                let storage = MeteredStorage::new(
+                    TokioStorage::new(
+                        TokioStorageConfig::new(
+                            self.cfg.storage_directory.clone(),
+                            self.cfg.storage_blob_layouts.clone(),
+                        ),
+                        storage_buffer_pool.clone(),
+                    ),
+                    &mut runtime_registry,
+                );
+            }
+        }
+
+        // Make any storage a prior process left in the page cache crash-durable before we open it,
+        // so the data read during init is durable. This runs under the hold, after any straggling
+        // writes from a previous run have landed, so the flush covers them too.
+        if let Err(e) = crate::storage::sync(&self.cfg.storage_directory) {
+            panic!(
+                "failed to sync storage filesystem at startup ({}): {e}",
+                self.cfg.storage_directory.display()
+            );
+        }
+
+        // Initialize network
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "iouring-network")] {
+                let mut iouring_registry = runtime_registry.sub_registry("iouring_network");
+                let config = IoUringNetworkConfig {
+                    tcp_nodelay: self.cfg.network_cfg.tcp_nodelay,
+                    zero_linger: self.cfg.network_cfg.zero_linger,
+                    connect_timeout: self.cfg.network_cfg.connect_timeout,
+                    read_write_timeout: self.cfg.network_cfg.read_write_timeout,
+                    iouring_config: iouring::Config {
+                        // TODO (#1045): make `IOURING_NETWORK_SIZE` configurable
+                        size: IOURING_NETWORK_SIZE,
+                        max_request_timeout: self.cfg.network_cfg.read_write_timeout,
+                        shutdown_timeout: Some(self.cfg.network_cfg.read_write_timeout),
+                        ..Default::default()
+                    },
+                    thread_stack_size: self.cfg.thread_stack_size,
+                    ..Default::default()
+                };
+                let network = MeteredNetwork::new(
+                    IoUringNetwork::start(
+                        config,
+                        &mut iouring_registry,
+                        network_buffer_pool.clone(),
+                    )
+                    .unwrap(),
+                    &mut runtime_registry,
+                );
+            } else {
+                let config = TokioNetworkConfig::default()
+                    .with_connect_timeout(self.cfg.network_cfg.connect_timeout)
+                    .with_read_timeout(self.cfg.network_cfg.read_write_timeout)
+                    .with_write_timeout(self.cfg.network_cfg.read_write_timeout)
+                    .with_tcp_nodelay(self.cfg.network_cfg.tcp_nodelay)
+                    .with_zero_linger(self.cfg.network_cfg.zero_linger);
+                let network = MeteredNetwork::new(
+                    TokioNetwork::new(config, network_buffer_pool.clone()),
+                    &mut runtime_registry,
+                );
+            }
+        }
+
+        // Initialize executor
+        let executor = Arc::new(Executor {
+            registry,
+            metrics,
+            runtime: runtime.handle().clone(),
+            tasks: Arc::new(TaskTracker::default()),
+            shutdown: Mutex::new(Stopper::default()),
+            panicker,
+            thread_stack_size: self.cfg.thread_stack_size,
+        });
+
+        // Get metrics
+        let label = Label::root();
+        executor.metrics.tasks_spawned.get_or_create(&label).inc();
+        let gauge = executor.metrics.tasks_running.get_or_create(&label).clone();
+
+        // Run the future
+        let tree = Tree::root();
+        let context = Context {
+            storage,
+            name: label.name(),
+            attributes: Vec::new(),
+            executor: executor.clone(),
+            network,
+            network_buffer_pool,
+            storage_buffer_pool,
+            tree: Arc::clone(&tree),
+            execution: Execution::default(),
+        };
+        let output = catch_unwind(AssertUnwindSafe(|| {
+            runtime.block_on(panicked.interrupt(f(context)))
+        }));
+        executor.tasks.close();
+        tree.abort();
+        runtime.block_on(executor.tasks.wait());
+        gauge.dec();
+
+        match output {
+            Ok(output) => output,
+            Err(panic) => resume_unwind(panic),
+        }
+    }
+}
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "iouring-storage")] {
+        type Storage = MeteredStorage<IoUringStorage>;
+    } else {
+        type Storage = MeteredStorage<TokioStorage>;
+    }
+}
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "iouring-network")] {
+        type Network = MeteredNetwork<IoUringNetwork>;
+    } else {
+        type Network = MeteredNetwork<TokioNetwork>;
+    }
+}
+
+/// Implementation of [crate::Spawner], [crate::Clock],
+/// [crate::Network], and [crate::Storage] for the `tokio`
+/// runtime.
+pub struct Context {
+    name: String,
+    attributes: Vec<(String, String)>,
+    executor: Arc<Executor>,
+    storage: Storage,
+    network: Network,
+    network_buffer_pool: BufferPool,
+    storage_buffer_pool: BufferPool,
+    tree: Arc<Tree>,
+    execution: Execution,
+}
+
+impl Context {
+    /// Access the [Metrics] of the runtime.
+    fn metrics(&self) -> &Metrics {
+        &self.executor.metrics
+    }
+}
+
+impl crate::Spawner for Context {
+    fn dedicated(mut self) -> Self {
+        self.execution = Execution::Dedicated;
+        self
+    }
+
+    fn shared(mut self, blocking: bool) -> Self {
+        self.execution = Execution::Shared(blocking);
+        self
+    }
+
+    fn spawn<F, Fut, T>(mut self, f: F) -> Handle<T>
+    where
+        F: FnOnce(Self) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        // Get metrics
+        let (_, metric) = spawn_metrics!(self);
+
+        // Track supervision before resetting configuration
+        let parent = Arc::clone(&self.tree);
+        let past = self.execution;
+        self.execution = Execution::default();
+        let (child, aborted) = Tree::child(&parent);
+        if aborted {
+            return Handle::closed(metric);
+        }
+        self.tree = child;
+
+        // Spawn the task
+        let executor = self.executor.clone();
+        let Some(task_guard) = executor.tasks.admit() else {
+            return Handle::closed(metric);
+        };
+        let future = f(self);
+        let (f, handle) = Handle::init(
+            future,
+            metric,
+            executor.panicker.clone(),
+            Arc::clone(&parent),
+        );
+        let f = async move {
+            let _task_guard = task_guard;
+            f.await;
+        };
+
+        if matches!(past, Execution::Dedicated) {
+            utils::thread::spawn(executor.thread_stack_size, {
+                // Ensure the task can access the tokio runtime
+                let handle = executor.runtime.clone();
+                move || {
+                    handle.block_on(f);
+                }
+            });
+        } else if matches!(past, Execution::Shared(true)) {
+            executor.runtime.spawn_blocking({
+                // Ensure the task can access the tokio runtime
+                let handle = executor.runtime.clone();
+                move || {
+                    handle.block_on(f);
+                }
+            });
+        } else {
+            executor.runtime.spawn(f);
+        }
+
+        // Register the task on the parent
+        if let Some(aborter) = handle.aborter() {
+            parent.register(aborter);
+        }
+
+        handle
+    }
+
+    async fn stop(self, value: i32, timeout: Option<Duration>) -> Result<(), Error> {
+        let stop_resolved = {
+            let mut shutdown = self.executor.shutdown.lock();
+            shutdown.stop(value)
+        };
+
+        // Wait for all tasks to complete or the timeout to fire
+        let timeout_future = timeout.map_or_else(
+            || futures::future::Either::Right(futures::future::pending()),
+            |duration| futures::future::Either::Left(self.sleep(duration)),
+        );
+        select! {
+            result = stop_resolved => {
+                result.map_err(|_| Error::Closed)?;
+                Ok(())
+            },
+            _ = timeout_future => Err(Error::Timeout),
+        }
+    }
+
+    fn stopped(&self) -> Signal {
+        self.executor.shutdown.lock().stopped()
+    }
+}
+
+#[stability(BETA)]
+impl crate::Strategizer for Context {
+    fn strategy(&self, parallelism: NonZeroUsize) -> Rayon {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(parallelism.get())
+            .stack_size(self.executor.thread_stack_size)
+            .build()
+            .expect("failed to create Tokio Rayon thread pool");
+        Rayon::with_pool(Arc::new(pool))
+    }
+}
+
+impl crate::Supervisor for Context {
+    fn child(&self, label: &'static str) -> Self {
+        let (tree, _) = Tree::child(&self.tree);
+        Self {
+            name: child_label(&self.name, label),
+            attributes: self.attributes.clone(),
+            executor: self.executor.clone(),
+            storage: self.storage.clone(),
+            network: self.network.clone(),
+            network_buffer_pool: self.network_buffer_pool.clone(),
+            storage_buffer_pool: self.storage_buffer_pool.clone(),
+            tree,
+            execution: Execution::default(),
+        }
+    }
+
+    fn with_attribute(mut self, key: &'static str, value: impl std::fmt::Display) -> Self {
+        // Validate label format (must match [a-zA-Z][a-zA-Z0-9_]*)
+        validate_label(key);
+
+        // Add the attribute to the list of attributes
+        add_attribute(&mut self.attributes, key, value);
+        self
+    }
+
+    fn name(&self) -> Name {
+        Name {
+            label: self.name.clone(),
+            attributes: self.attributes.clone(),
+        }
+    }
+}
+
+impl crate::Metrics for Context {
+    fn register<N: Into<String>, H: Into<String>, M: Metric>(
+        &self,
+        name: N,
+        help: H,
+        metric: M,
+    ) -> Registered<M> {
+        let name = name.into();
+        let help = help.into();
+        let metric = Arc::new(metric);
+        self.executor.registry.register(
+            prefixed_name(&self.name, &name),
+            help,
+            self.attributes.clone(),
+            metric,
+        )
+    }
+
+    fn encode(&self) -> String {
+        self.executor.registry.encode()
+    }
+}
+
+impl Clock for Context {
+    fn current(&self) -> SystemTime {
+        SystemTime::now()
+    }
+
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send + 'static {
+        tokio::time::sleep(duration)
+    }
+
+    fn sleep_until(&self, deadline: SystemTime) -> impl Future<Output = ()> + Send + 'static {
+        let duration_until_deadline = deadline.duration_since(self.current()).unwrap_or_default();
+        tokio::time::sleep(duration_until_deadline)
+    }
+}
+
+#[cfg(feature = "external")]
+impl Pacer for Context {
+    fn pace<'a, F, T>(
+        &'a self,
+        _latency: Duration,
+        future: F,
+    ) -> impl Future<Output = T> + Send + 'a
+    where
+        F: Future<Output = T> + Send + 'a,
+        T: Send + 'a,
+    {
+        // Execute the future immediately
+        future
+    }
+}
+
+impl GClock for Context {
+    type Instant = SystemTime;
+
+    fn now(&self) -> Self::Instant {
+        self.current()
+    }
+}
+
+impl ReasonablyRealtime for Context {}
+
+impl crate::Network for Context {
+    type Listener = <Network as crate::Network>::Listener;
+
+    async fn bind(&self, socket: SocketAddr) -> Result<Self::Listener, Error> {
+        self.network.bind(socket).await
+    }
+
+    async fn dial(&self, socket: SocketAddr) -> Result<(SinkOf<Self>, StreamOf<Self>), Error> {
+        self.network.dial(socket).await
+    }
+}
+
+impl crate::Resolver for Context {
+    async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, Error> {
+        // Uses the host's DNS configuration (e.g. /etc/resolv.conf). This delegates to the
+        // system's libc resolver.
+        //
+        // The `:0` port is required by lookup_host's API but is not used
+        // for DNS resolution.
+        let addrs = tokio::net::lookup_host(format!("{host}:0"))
+            .await
+            .map_err(|e| Error::ResolveFailed(e.to_string()))?;
+        Ok(addrs.map(|addr| addr.ip()).collect())
+    }
+}
+
+impl TryRng for Context {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(sys_rng().next_u32())
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(sys_rng().next_u64())
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+        sys_rng().fill_bytes(dest);
+        Ok(())
+    }
+}
+
+impl TryCryptoRng for Context {}
+
+impl crate::Storage for Context {
+    type Blob = <Storage as crate::Storage>::Blob;
+
+    async fn open_versioned(
+        &self,
+        partition: &str,
+        name: &[u8],
+        versions: std::ops::RangeInclusive<BlobVersion>,
+    ) -> Result<(Self::Blob, u64, BlobVersion), Error> {
+        self.storage.open_versioned(partition, name, versions).await
+    }
+
+    async fn remove(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
+        self.storage.remove(partition, name).await
+    }
+
+    async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
+        self.storage.scan(partition).await
+    }
+}
+
+impl crate::BufferPooler for Context {
+    fn network_buffer_pool(&self) -> &BufferPool {
+        &self.network_buffer_pool
+    }
+
+    fn storage_buffer_pool(&self) -> &BufferPool {
+        &self.storage_buffer_pool
+    }
+}
+
+#[cfg(test)]
+#[allow(deprecated)]
+mod tests {
+    use super::*;
+    use crate::{
+        Blob as _, Metrics, Network, Resolver, Runner as _, Sink, Spawner as _, Storage as _,
+        Strategizer as _, Stream, Supervisor as _, telemetry::metrics::raw::Counter,
+        tokio::telemetry,
+    };
+    use bytes::Bytes;
+    use commonware_parallel::Strategy as _;
+    use std::{
+        self,
+        collections::HashMap,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        str::FromStr,
+    };
+    use tracing::{Level, error};
+
+    struct TaskDropGate {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Drop for TaskDropGate {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RootExit {
+        Return,
+        FuturePanic,
+        ConstructorPanic,
+    }
+
+    fn spawn_drop_gated_task(
+        context: Context,
+        execution: Execution,
+        drop_gate: TaskDropGate,
+        ready: Option<commonware_utils::channel::oneshot::Sender<()>>,
+    ) {
+        let child = match execution {
+            Execution::Dedicated => context.dedicated(),
+            Execution::Shared(blocking) => context.shared(blocking),
+        };
+        child.spawn(move |context| async move {
+            let _context = context;
+            let _drop_gate = drop_gate;
+            if let Some(ready) = ready {
+                ready.send(()).unwrap();
+            }
+            futures::future::pending::<()>().await;
+        });
+    }
+
+    fn assert_runner_drains_spawned_task(execution: Execution, root_exit: RootExit) {
+        let cfg = Config::new();
+        let storage_directory = cfg.storage_directory().clone();
+        let (ready_tx, ready_rx) = commonware_utils::channel::oneshot::channel();
+        let (drop_entered_tx, drop_entered_rx) = std::sync::mpsc::channel();
+        let (drop_release_tx, drop_release_rx) = std::sync::mpsc::channel();
+        let (runner_done_tx, runner_done_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let drop_gate = TaskDropGate {
+                    entered: drop_entered_tx,
+                    release: drop_release_rx,
+                };
+                match root_exit {
+                    RootExit::ConstructorPanic => {
+                        Runner::new(cfg).start(move |context| -> futures::future::Pending<()> {
+                            spawn_drop_gated_task(context, execution, drop_gate, None);
+                            panic!("root constructor panic after spawning child");
+                        })
+                    }
+                    RootExit::Return | RootExit::FuturePanic => {
+                        Runner::new(cfg).start(move |context| async move {
+                            spawn_drop_gated_task(context, execution, drop_gate, Some(ready_tx));
+                            ready_rx.await.unwrap();
+                            assert!(
+                                matches!(root_exit, RootExit::Return),
+                                "root future panic after spawning child"
+                            );
+                        })
+                    }
+                }
+            }));
+            runner_done_tx.send(result.is_err()).unwrap();
+        });
+
+        drop_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("spawned task was not canceled after the root returned");
+        let early = runner_done_rx.recv_timeout(Duration::from_millis(250));
+        let returned_before_cleanup = match early {
+            Ok(panicked) => Some(panicked),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("Runner::start exited without reporting its result")
+            }
+        };
+        drop_release_tx.send(()).unwrap();
+        let panicked = returned_before_cleanup.unwrap_or_else(|| {
+            runner_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Runner::start did not return after task cleanup completed")
+        });
+        runner.join().unwrap();
+        let _ = std::fs::remove_dir_all(storage_directory);
+        assert!(
+            returned_before_cleanup.is_none(),
+            "Runner::start returned before {execution:?} task cleanup completed"
+        );
+        assert_eq!(panicked, !matches!(root_exit, RootExit::Return));
+    }
+
+    fn run_with_returned_strategy(retain: bool) -> Option<Rayon> {
+        let cfg = Config::new();
+        let storage_directory = cfg.storage_directory().clone();
+        let (strategy_tx, strategy_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let strategy = Runner::new(cfg).start(move |context| async move {
+                let strategy = context.strategy(NZUsize!(2));
+                strategy.spawn(1, |_| ()).await;
+                retain.then_some(strategy)
+            });
+            strategy_tx.send(strategy).unwrap();
+        });
+
+        let strategy = strategy_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Runner::start did not return after the strategy completed work");
+        runner.join().unwrap();
+        let _ = std::fs::remove_dir_all(storage_directory);
+        strategy
+    }
+
+    #[test]
+    fn test_storage_blob_layout_restriction() {
+        // The default policy accepts legacy V0 blobs while selecting V1 for new blobs.
+        let cfg = Config::new();
+        let storage_directory = cfg.storage_directory().clone();
+        assert_eq!(cfg.storage_blob_layouts(), &BlobLayout::ALL);
+
+        let partition = "layout_restriction";
+        let v0_name = b"v0";
+        let partition_directory = storage_directory.join(partition);
+        std::fs::create_dir_all(&partition_directory).unwrap();
+        let v0_path = partition_directory.join(commonware_formatting::hex(v0_name));
+        let v0_bytes = crate::storage::tests::v0_blob_bytes(0, b"payload");
+        std::fs::write(&v0_path, &v0_bytes).unwrap();
+
+        Runner::new(cfg).start(|context| async move {
+            let (blob, size) = context.open(partition, v0_name).await.unwrap();
+            assert_eq!(size, 7);
+            let payload = blob
+                .read_at(0, 7, crate::ReadOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(payload.coalesce(), b"payload".as_slice());
+        });
+
+        // A V1-only policy rejects V0 without modifying it and creates new blobs as V1.
+        let cfg = Config::new()
+            .with_storage_directory(storage_directory.clone())
+            .with_storage_blob_layouts(BlobLayout::V1..=BlobLayout::V1);
+        Runner::new(cfg).start(|context| async move {
+            let result = context.open(partition, v0_name).await;
+            assert!(matches!(
+                result,
+                Err(Error::BlobLayoutMismatch { expected, found })
+                    if expected == (BlobLayout::V1..=BlobLayout::V1)
+                        && found == BlobLayout::V0
+            ));
+
+            context.open(partition, b"v1").await.unwrap();
+        });
+
+        assert_eq!(std::fs::read(&v0_path).unwrap(), v0_bytes);
+        let v1_path = partition_directory.join(commonware_formatting::hex(b"v1"));
+        let v1 = std::fs::read(&v1_path).unwrap();
+        assert_eq!(&v1[..4], &BlobLayout::V1.magic());
+
+        // A V0-only policy rejects the intact header-only V1 blob without healing it and
+        // creates new blobs the rollback target can read and write.
+        let cfg = Config::new()
+            .with_storage_directory(storage_directory.clone())
+            .with_storage_blob_layouts(BlobLayout::V0..=BlobLayout::V0);
+        Runner::new(cfg).start(|context| async move {
+            let result = context.open(partition, b"v1").await;
+            assert!(matches!(
+                result,
+                Err(Error::BlobLayoutMismatch { expected, found })
+                    if expected == (BlobLayout::V0..=BlobLayout::V0)
+                        && found == BlobLayout::V1
+            ));
+
+            let (blob, size) = context.open(partition, b"rollback").await.unwrap();
+            assert_eq!(size, 0);
+            blob.write_at(0, b"rollback!".as_slice(), crate::WriteOptions::SYNC)
+                .await
+                .unwrap();
+            drop(blob);
+            let (blob, size) = context.open(partition, b"rollback").await.unwrap();
+            assert_eq!(size, 9);
+            let payload = blob
+                .read_at(0, 9, crate::ReadOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(payload.coalesce(), b"rollback!".as_slice());
+        });
+
+        assert_eq!(std::fs::read(&v1_path).unwrap(), v1);
+        let rollback_path = partition_directory.join(commonware_formatting::hex(b"rollback"));
+        let rollback = std::fs::read(rollback_path).unwrap();
+        assert_eq!(&rollback[..4], &BlobLayout::V0.magic());
+        assert_eq!(&rollback[8..], b"rollback!");
+        let _ = std::fs::remove_dir_all(storage_directory);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty")]
+    fn test_storage_blob_layout_restriction_rejects_empty_range() {
+        let _ = Config::new().with_storage_blob_layouts(BlobLayout::V1..=BlobLayout::V0);
+    }
+
+    #[test]
+    fn test_worker_threads_updates_default_buffer_pool_parallelism() {
+        let cfg = Config::new().with_worker_threads(8);
+
+        assert_eq!(cfg.worker_threads, 8);
+        let network = cfg.resolved_network_buffer_pool_config();
+        assert_eq!(network.parallelism(), NZUsize!(8));
+        assert_eq!(
+            network.thread_cache_config,
+            BufferPoolConfig::for_network().thread_cache_config
+        );
+
+        let storage = cfg.resolved_storage_buffer_pool_config();
+        assert_eq!(storage.parallelism(), NZUsize!(8));
+        assert_eq!(
+            storage.thread_cache_config,
+            BufferPoolConfig::for_storage().thread_cache_config
+        );
+    }
+
+    #[test]
+    fn test_default_thread_stack_size_uses_system_default() {
+        let cfg = Config::new();
+        assert_eq!(
+            cfg.thread_stack_size(),
+            utils::thread::system_thread_stack_size()
+        );
+    }
+
+    #[test]
+    fn test_runner_waits_for_spawned_task_cancellation() {
+        for execution in [
+            Execution::Shared(false),
+            Execution::Shared(true),
+            Execution::Dedicated,
+        ] {
+            for root_exit in [
+                RootExit::Return,
+                RootExit::FuturePanic,
+                RootExit::ConstructorPanic,
+            ] {
+                assert_runner_drains_spawned_task(execution, root_exit);
+            }
+        }
+    }
+
+    #[test]
+    fn test_runner_start_waits_for_previous_run() {
+        let cfg = Config::new();
+        let storage_directory = cfg.storage_directory().clone();
+
+        // The first run keeps its context, and with it the storage directory,
+        // until it is released.
+        let (started, first_started) = std::sync::mpsc::channel();
+        let (release, released) = futures::channel::oneshot::channel();
+        let first_cfg = cfg.clone();
+        let first = std::thread::spawn(move || {
+            Runner::new(first_cfg).start(|context| async move {
+                started.send(()).unwrap();
+                released.await.unwrap();
+                drop(context);
+            });
+        });
+        first_started.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        // A second run on the same directory cannot start until the first has
+        // returned.
+        let (started, second_started) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            Runner::new(cfg).start(|_| async move {
+                started.send(()).unwrap();
+            });
+        });
+        match second_started.recv_timeout(Duration::from_millis(200)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            other => panic!("second run started while the first held the directory: {other:?}"),
+        }
+        release.send(()).unwrap();
+        first.join().unwrap();
+        second_started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("second run did not start after the first returned");
+        second.join().unwrap();
+        let _ = std::fs::remove_dir_all(storage_directory);
+    }
+
+    #[test]
+    fn test_runner_owns_runtime_when_context_escapes() {
+        let cfg = Config::new();
+        let storage_directory = cfg.storage_directory().clone();
+        let (ready_tx, ready_rx) = commonware_utils::channel::oneshot::channel();
+        let (drop_entered_tx, drop_entered_rx) = std::sync::mpsc::channel();
+        let (drop_release_tx, drop_release_rx) = std::sync::mpsc::channel();
+        let (runner_returned_tx, runner_returned_rx) = std::sync::mpsc::channel();
+        let (context_release_tx, context_release_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let context = Runner::new(cfg).start(move |context| async move {
+                context.executor.runtime.spawn(async move {
+                    let _drop_gate = TaskDropGate {
+                        entered: drop_entered_tx,
+                        release: drop_release_rx,
+                    };
+                    ready_tx.send(()).unwrap();
+                    futures::future::pending::<()>().await;
+                });
+                ready_rx.await.unwrap();
+                context
+            });
+            runner_returned_tx.send(()).unwrap();
+            context_release_rx.recv().unwrap();
+            drop(context);
+        });
+
+        let returned_early = runner_returned_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_ok();
+        if returned_early {
+            drop_release_tx.send(()).unwrap();
+            context_release_tx.send(()).unwrap();
+            drop_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("escaped Context did not retain the raw runtime task");
+        } else {
+            drop_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Runner did not cancel its raw runtime task");
+            drop_release_tx.send(()).unwrap();
+            runner_returned_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Runner did not return after raw task cleanup");
+            context_release_tx.send(()).unwrap();
+        }
+        runner.join().unwrap();
+        let _ = std::fs::remove_dir_all(storage_directory);
+        assert!(
+            !returned_early,
+            "a returned Context kept the Tokio runtime alive after Runner::start"
+        );
+    }
+
+    #[test]
+    fn test_runner_returns_strategy_after_pool_work() {
+        assert!(run_with_returned_strategy(false).is_none());
+
+        let strategy = run_with_returned_strategy(true).unwrap();
+        assert_eq!(futures::executor::block_on(strategy.spawn(1, |_| 42)), 42);
+    }
+
+    #[test]
+    fn test_runner_resumes_strategy_panic_payload_after_pool_work() {
+        let cfg = Config::new();
+        let storage_directory = cfg.storage_directory().clone();
+        let (strategy_tx, strategy_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let result: std::thread::Result<()> =
+                std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    Runner::new(cfg).start(move |context| async move {
+                        let strategy = context.strategy(NZUsize!(2));
+                        strategy.spawn(1, |_| ()).await;
+                        std::panic::panic_any(strategy);
+                    });
+                }));
+            let strategy = result
+                .expect_err("Runner::start did not resume the root panic")
+                .downcast::<Rayon>()
+                .expect("Runner::start changed the root panic payload");
+            strategy_tx.send(*strategy).unwrap();
+        });
+
+        let strategy = strategy_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Runner::start did not resume the strategy panic payload");
+        runner.join().unwrap();
+        let _ = std::fs::remove_dir_all(storage_directory);
+        assert_eq!(futures::executor::block_on(strategy.spawn(1, |_| 42)), 42);
+    }
+
+    #[test]
+    fn test_thread_stack_size_override() {
+        let cfg = Config::new().with_thread_stack_size(4 * 1024 * 1024);
+        assert_eq!(cfg.thread_stack_size(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_explicit_buffer_pool_configs_override_worker_threads() {
+        // Order does not matter -- explicit configs always win.
+        let cfg = Config::new()
+            .with_network_buffer_pool_config(
+                BufferPoolConfig::for_network().with_parallelism(NZUsize!(2)),
+            )
+            .with_worker_threads(8)
+            .with_storage_buffer_pool_config(
+                BufferPoolConfig::for_storage().with_thread_cache_disabled(),
+            );
+
+        let network = cfg.resolved_network_buffer_pool_config();
+        assert_eq!(network.parallelism(), NZUsize!(2));
+        assert_eq!(
+            network.thread_cache_config,
+            BufferPoolConfig::for_network().thread_cache_config
+        );
+
+        let storage = cfg.resolved_storage_buffer_pool_config();
+        assert_eq!(storage.parallelism(), NZUsize!(1));
+        assert_eq!(
+            storage.thread_cache_config,
+            BufferPoolConfig::for_storage()
+                .with_thread_cache_disabled()
+                .thread_cache_config
+        );
+    }
+
+    #[test]
+    fn test_process_rss_metric() {
+        let executor = Runner::default();
+        executor.start(|context| async move {
+            loop {
+                // Wait for RSS metric to be available
+                let metrics = context.encode();
+                if !metrics.contains("runtime_process_rss") {
+                    context.sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+
+                // Verify the RSS value is eventually populated (greater than 0)
+                for line in metrics.lines() {
+                    if line.starts_with("runtime_process_rss")
+                        && !line.starts_with("runtime_process_rss{")
+                    {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let rss_value: i64 =
+                                parts[1].parse().expect("Failed to parse RSS value");
+                            if rss_value > 0 {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_telemetry() {
+        let executor = Runner::default();
+        executor.start(|context| async move {
+            // Define the server address
+            let address = SocketAddr::from_str("127.0.0.1:8000").unwrap();
+
+            // Configure telemetry
+            telemetry::init(
+                context.child("metrics"),
+                telemetry::Logs {
+                    level: Level::INFO,
+                    json: false,
+                },
+                Some(address),
+                None,
+            );
+
+            // Register a test metric
+            let counter: Counter<u64> = Counter::default();
+            let _registered = context.register("test_counter", "Test counter", counter.clone());
+            counter.inc();
+
+            // Helper functions to parse HTTP response
+            async fn read_line<St: Stream>(stream: &mut St) -> Result<String, Error> {
+                let mut line = Vec::new();
+                loop {
+                    let received = stream.recv(1).await?;
+                    let byte = received.coalesce().as_ref()[0];
+                    if byte == b'\n' {
+                        if line.last() == Some(&b'\r') {
+                            line.pop(); // Remove trailing \r
+                        }
+                        break;
+                    }
+                    line.push(byte);
+                }
+                String::from_utf8(line).map_err(|_| Error::ReadFailed)
+            }
+
+            async fn read_headers<St: Stream>(
+                stream: &mut St,
+            ) -> Result<HashMap<String, String>, Error> {
+                let mut headers = HashMap::new();
+                loop {
+                    let line = read_line(stream).await?;
+                    if line.is_empty() {
+                        break;
+                    }
+                    let parts: Vec<&str> = line.splitn(2, ": ").collect();
+                    if parts.len() == 2 {
+                        headers.insert(parts[0].to_string(), parts[1].to_string());
+                    }
+                }
+                Ok(headers)
+            }
+
+            async fn read_body<St: Stream>(
+                stream: &mut St,
+                content_length: usize,
+            ) -> Result<String, Error> {
+                let received = stream.recv(content_length).await?;
+                String::from_utf8(received.coalesce().into()).map_err(|_| Error::ReadFailed)
+            }
+
+            // Simulate a client connecting to the server
+            let client_handle = context.child("client").spawn(move |context| async move {
+                let (mut sink, mut stream) = loop {
+                    match context.dial(address).await {
+                        Ok((sink, stream)) => break (sink, stream),
+                        Err(e) => {
+                            // The client may be polled before the server is ready, that's alright!
+                            error!(err =?e, "failed to connect");
+                            context.sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                };
+
+                // Send a GET request to the server
+                let request = format!(
+                    "GET /metrics HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+                );
+                sink.send(Bytes::from(request)).await.unwrap();
+
+                // Read and verify the HTTP status line
+                let status_line = read_line(&mut stream).await.unwrap();
+                assert_eq!(status_line, "HTTP/1.1 200 OK");
+
+                // Read and parse headers
+                let headers = read_headers(&mut stream).await.unwrap();
+                println!("Headers: {headers:?}");
+                let content_length = headers
+                    .get("content-length")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+
+                // Read and verify the body
+                let body = read_body(&mut stream, content_length).await.unwrap();
+                assert!(body.contains("test_counter_total 1"));
+            });
+
+            // Wait for the client task to complete
+            client_handle.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_resolver() {
+        let executor = Runner::default();
+        executor.start(|context| async move {
+            let addrs = context.resolve("localhost").await.unwrap();
+            assert!(!addrs.is_empty());
+            for addr in addrs {
+                assert!(
+                    addr == IpAddr::V4(Ipv4Addr::LOCALHOST)
+                        || addr == IpAddr::V6(Ipv6Addr::LOCALHOST)
+                );
+            }
+        });
+    }
+}

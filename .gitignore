@@ -1,0 +1,12 @@
+target/
+
+# Devnet block logs, state snapshots and run output
+*.jsonl
+*.jsonl.snapshot
+*.jsonl.tmp
+*.jsonl.snapshot.tmp
+*.jsonl.candles
+*.jsonl.candles.tmp
+run/
+
+.DS_Store

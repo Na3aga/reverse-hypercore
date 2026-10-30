@@ -1,0 +1,80 @@
+//! Recording metrics with a status.
+
+use super::{EncodeLabelSet, EncodeLabelValue, Registered, raw};
+
+/// Metric label that indicates status.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct Label {
+    /// The value of the label.
+    status: Status,
+}
+
+/// Possible values for the status label.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum Status {
+    /// Processed successfully.
+    Success,
+    /// Processing produced one of multiple valid results but did not satisfy the request.
+    Ambiguous,
+    /// Processing failed.
+    Failure,
+    /// Input was malformed or invalid in some way. Indicates a client error.
+    Invalid,
+    /// Input was valid, but intentionally not processed.
+    /// For example due to a rate limit, being a duplicate, etc.
+    Dropped,
+    /// Processing returned no result before some deadline.
+    Timeout,
+}
+
+/// Raw family backing a status [`Counter`]. Construct this and pass it to
+/// [`crate::Metrics::register`].
+pub type Raw = raw::Family<Label, raw::Counter>;
+
+/// A registered counter metric with a status label.
+pub type Counter = Registered<Raw>;
+
+impl Counter {
+    /// Create a new CounterGuard with a given status.
+    pub fn guard(&self, status: Status) -> CounterGuard {
+        CounterGuard {
+            metric: self.clone(),
+            status,
+        }
+    }
+
+    /// Increment the metric with a given status.
+    pub fn inc(&self, status: Status) {
+        self.get_or_create(&Label { status }).inc();
+    }
+
+    /// Increment the metric with a given status.
+    pub fn inc_by(&self, status: Status, n: u64) {
+        self.get_or_create(&Label { status }).inc_by(n);
+    }
+}
+
+/// Increments a `Counter` metric when dropped.
+///
+/// Can be used to ensure that counters are incremented regardless of the control flow. For example,
+/// if a function returns early, the metric will still be incremented.
+pub struct CounterGuard {
+    /// The metric to increment.
+    metric: Counter,
+
+    /// The status at which the metric is set to be incremented.
+    status: Status,
+}
+
+impl CounterGuard {
+    /// Modify the status at which the metric will be incremented.
+    pub const fn set(&mut self, status: Status) {
+        self.status = status;
+    }
+}
+
+impl Drop for CounterGuard {
+    fn drop(&mut self) {
+        self.metric.inc(self.status);
+    }
+}
