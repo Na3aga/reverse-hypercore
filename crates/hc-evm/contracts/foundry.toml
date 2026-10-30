@@ -1,0 +1,13 @@
+# Build: cd crates/hc-evm/contracts && forge build
+# Artifacts are committed under out/ so the Rust build never needs solc.
+[profile.default]
+src = "."
+out = "out"
+libs = []
+cache = false
+solc_version = "0.8.28"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+bytecode_hash = "none"
+cbor_metadata = false

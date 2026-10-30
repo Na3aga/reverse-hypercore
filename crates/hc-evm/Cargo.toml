@@ -1,0 +1,21 @@
+[package]
+name = "hc-evm"
+description = "Deterministic HyperEVM-like execution wrapper around revm: CoreWriter system contract, core-state read precompiles, USDC bridge."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+revm.workspace = true
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-rlp.workspace = true
+alloy-sol-types.workspace = true
+serde.workspace = true
+postcard.workspace = true
+
+[dev-dependencies]
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+serde_json.workspace = true
