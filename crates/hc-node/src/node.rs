@@ -21,6 +21,37 @@ pub struct LogEntry {
     pub payload: String,
     /// State hash after executing this block.
     pub state_hash: Hash32,
+    /// Hex of the consensus digest of the block (empty in older logs).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub digest: String,
+    /// Hex of the block's finalization certificate, when one named it. A
+    /// validator rejoins a running chain from the last one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub certificate: String,
+}
+
+impl LogEntry {
+    pub fn new(f: &Finalized, state_hash: Hash32) -> LogEntry {
+        LogEntry {
+            height: f.height,
+            view: f.view,
+            proposer: f.proposer,
+            payload: hex_encode(&f.payload),
+            state_hash,
+            digest: if f.digest == [0; 32] { String::new() } else { hex_encode(&f.digest) },
+            certificate: hex_encode(&f.certificate),
+        }
+    }
+
+    /// The finalized block this line records.
+    pub fn finalized(&self) -> Result<Finalized, String> {
+        let hex = |s: &str, what: &str| hc_core::types::hex_decode(s).ok_or_else(|| format!("bad {what} hex at height {}", self.height));
+        let mut digest = [0u8; 32];
+        if !self.digest.is_empty() {
+            digest.copy_from_slice(&hex(&self.digest, "digest")?.get(..32).ok_or("short digest")?[..32]);
+        }
+        Ok(Finalized { view: self.view, height: self.height, proposer: self.proposer, digest, payload: hex(&self.payload, "payload")?, certificate: hex(&self.certificate, "certificate")? })
+    }
 }
 
 pub struct Shared {
@@ -265,7 +296,7 @@ impl LogSink {
             while let Some(msg) = next {
                 match msg {
                     LogMsg::Block(f, state_hash) => {
-                        let entry = LogEntry { height: f.height, view: f.view, proposer: f.proposer, payload: hex_encode(&f.payload), state_hash };
+                        let entry = LogEntry::new(&f, state_hash);
                         let line = serde_json::to_string(&entry).expect("log entry encodes");
                         let _ = writeln!(w, "{line}");
                         self.offset += line.len() as u64 + 1;
@@ -432,6 +463,9 @@ pub struct Loaded {
     pub segment_start: u64,
     /// Length of the log up to its last complete line.
     pub valid_len: u64,
+    /// The last logged block, if it has a finalization certificate:
+    /// (height, certificate). A validator rejoins a running chain from it.
+    pub last_certificate: Option<(u64, Vec<u8>)>,
 }
 
 /// Genesis of a devnet log from its header line.
@@ -496,6 +530,7 @@ pub fn load_chain(path: &std::path::Path, use_snapshot: bool, mut on_block: impl
     };
     let start_height = state.height;
     let mut state = state;
+    let mut last_certificate = None;
     loop {
         line.clear();
         let n = r.read_line(&mut line).map_err(|e| e.to_string())?;
@@ -510,15 +545,15 @@ pub fn load_chain(path: &std::path::Path, use_snapshot: bool, mut on_block: impl
         if e.height <= state.height {
             continue;
         }
-        let payload = hc_core::types::hex_decode(&e.payload).ok_or_else(|| format!("bad payload hex at height {}", e.height))?;
-        let f = Finalized { view: e.view, height: e.height, proposer: e.proposer, digest: [0; 32], payload };
+        let f = e.finalized()?;
         let (body, out) = execute(&mut state, &f, None);
         if out.state_hash != e.state_hash {
             return Err(format!("state hash mismatch at height {}: log {:?}, replay {:?}", e.height, e.state_hash, out.state_hash));
         }
+        last_certificate = (!f.certificate.is_empty()).then(|| (f.height, f.certificate.clone()));
         on_block(&state, &f, &body, &out);
     }
-    Ok(Some(Loaded { header, genesis, state, start_height, segment_start, valid_len }))
+    Ok(Some(Loaded { header, genesis, state, start_height, segment_start, valid_len, last_certificate }))
 }
 
 /// Entries of the block log at `path` from height `from`, at most `limit`.

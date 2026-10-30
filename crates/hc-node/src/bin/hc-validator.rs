@@ -83,6 +83,11 @@ struct RunArgs {
     /// restart together, each with `--resume`.
     #[arg(long)]
     resume: bool,
+    /// With --resume: join a chain whose other validators kept running. The
+    /// node catches up from its peers, then starts consensus from the
+    /// finalization certificate of the last block instead of genesis.
+    #[arg(long, requires = "resume")]
+    rejoin: bool,
     #[arg(long, default_value_t = 2_000)]
     snapshot_blocks: u64,
     #[arg(long, default_value_t = 2)]
@@ -155,10 +160,18 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(args.api).await?;
     let server = tokio::spawn(std::future::IntoFuture::into_future(axum::serve(listener, hc_node::api::router(shared.clone()))));
 
+    let mut floor = None;
     let (height_offset, log) = match resumed {
         Some(mut r) => {
             // Blocks finalized while this node was down: fetch, re-execute, check.
             sync_from_peers(&shared, &mut r, &args).await?;
+            if args.rejoin {
+                // Consensus starts at the last block this node has; it must carry a certificate.
+                match r.last_certificate.take() {
+                    Some((h, cert)) if h == r.state.height => floor = Some(cert),
+                    _ => anyhow::bail!("no finalization certificate for block {}; cannot rejoin (are the peers running?)", r.state.height),
+                }
+            }
             let log = LogSink::resume(&args.log, &r, args.snapshot_blocks, true)?;
             let h = r.state.height;
             *shared.state.write().expect("state lock") = r.state;
@@ -172,7 +185,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let gossip = hc_node::gossip::start(shared.clone());
     let (fin_tx, fin_rx) = tokio::sync::mpsc::unbounded_channel();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let cfg = hc_consensus::LiveConfig { seed: args.seed, block_interval_ms: args.block_interval_ms, worker_threads: args.consensus_threads, height_offset, ..Default::default() };
+    let cfg = hc_consensus::LiveConfig { seed: args.seed, block_interval_ms: args.block_interval_ms, worker_threads: args.consensus_threads, height_offset, floor, ..Default::default() };
     let consensus = hc_consensus::spawn_tokio_validator(cfg, args.index, args.peers.clone(), source, fin_tx, gossip, async move {
         let _ = stop_rx.await;
     })?;
@@ -271,14 +284,16 @@ async fn sync_from_peers(shared: &Shared, chain: &mut hc_node::node::Loaded, arg
             anyhow::bail!("node {i} cannot serve blocks from height {from} (its log starts after its last snapshot); restart this node's chain");
         }
         for e in entries {
-            let payload = hc_core::types::hex_decode(&e.payload).ok_or_else(|| anyhow::anyhow!("bad payload from node {i}"))?;
-            let fin = hc_consensus::Finalized { view: e.view, height: e.height, proposer: e.proposer, digest: [0; 32], payload };
+            let fin = e.finalized().map_err(|err| anyhow::anyhow!("bad block from node {i}: {err}"))?;
             let (body, out) = hc_node::node::execute(&mut chain.state, &fin, None);
             anyhow::ensure!(out.state_hash == e.state_hash, "block {} from node {i} executes to a different state hash", e.height);
             shared.history.write().expect("history lock").record(&chain.state, e.view, e.proposer, &body, &out);
             let line = format!("{}\n", serde_json::to_string(&e)?);
             file.write_all(line.as_bytes())?;
             chain.valid_len += line.len() as u64;
+            if !fin.certificate.is_empty() {
+                chain.last_certificate = Some((fin.height, fin.certificate.clone()));
+            }
         }
         tracing::info!(height = chain.state.height, from = i, "caught up from peer");
     }

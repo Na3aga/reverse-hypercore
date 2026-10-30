@@ -2903,6 +2903,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "commonware-actor",
+ "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-macros",

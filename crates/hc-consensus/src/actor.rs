@@ -16,7 +16,7 @@
 //! therefore message order) is identical across runs with the same seed.
 
 use crate::{
-    block::{self, Block, Wire, GENESIS, MAX_PAYLOAD_BYTES},
+    block::{self, Block, Wire, MAX_PAYLOAD_BYTES},
     Finalized, PayloadSource,
 };
 use bytes::Bytes;
@@ -73,6 +73,7 @@ pub(crate) enum Message {
     Finalized {
         view: u64,
         digest: Digest,
+        certificate: Vec<u8>,
     },
 }
 
@@ -134,9 +135,11 @@ impl Reporter for Mailbox {
         // of view v implies all its ancestors are final, so the actor walks the
         // parent chain to fill in any views it was not told about directly.
         if let Activity::Finalization(f) = activity {
+            use commonware_codec::Encode as _;
             return self.send(Message::Finalized {
                 view: f.view().get(),
                 digest: f.proposal.payload,
+                certificate: f.encode().to_vec(),
             });
         }
         Feedback::Ok
@@ -156,6 +159,9 @@ pub(crate) struct Config {
     pub sink: FinalizedSink,
     /// Delay between being asked to propose and building the payload.
     pub block_interval: Duration,
+    /// The last block the application already has: (view, digest). Genesis,
+    /// or the floor certificate's block when rejoining a running chain.
+    pub tip: (u64, Digest),
 }
 
 pub(crate) struct Actor<E: Clock + Spawner> {
@@ -171,8 +177,8 @@ pub(crate) struct Actor<E: Clock + Spawner> {
     /// Last block delivered to the sink: (view, digest).
     tip: (u64, Digest),
     height: u64,
-    /// Highest finalization certificate not yet fully delivered.
-    target: Option<(u64, Digest)>,
+    /// Highest finalization certificate not yet fully delivered, encoded.
+    target: Option<(u64, Digest, Vec<u8>)>,
 }
 
 impl<E: Clock + Spawner> Actor<E> {
@@ -180,6 +186,7 @@ impl<E: Clock + Spawner> Actor<E> {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             Self {
+                tip: cfg.tip,
                 context,
                 cfg,
                 self_sender: tx.clone(),
@@ -187,7 +194,6 @@ impl<E: Clock + Spawner> Actor<E> {
                 blocks: BTreeMap::new(),
                 verify_waiters: BTreeMap::new(),
                 wanted: BTreeSet::new(),
-                tip: (0, GENESIS),
                 height: 0,
                 target: None,
             },
@@ -298,12 +304,12 @@ impl<E: Clock + Spawner> Actor<E> {
                     false,
                 );
             }
-            Message::Finalized { view, digest } => {
+            Message::Finalized { view, digest, certificate } => {
                 if view <= self.tip.0 {
                     return;
                 }
-                if self.target.is_none_or(|(v, _)| view > v) {
-                    self.target = Some((view, digest));
+                if self.target.as_ref().is_none_or(|(v, _, _)| view > *v) {
+                    self.target = Some((view, digest, certificate));
                 }
                 self.advance(net);
             }
@@ -401,7 +407,7 @@ impl<E: Clock + Spawner> Actor<E> {
     /// finalization, walking parent links backwards. If an ancestor is missing,
     /// request it and resume when it arrives.
     fn advance<NS: Sender<PublicKey = PublicKey>>(&mut self, net: &mut NS) {
-        let Some((_, target)) = self.target else {
+        let Some((_, target, _)) = self.target else {
             return;
         };
         let mut chain = Vec::new();
@@ -419,6 +425,7 @@ impl<E: Clock + Spawner> Actor<E> {
             chain.push(cur);
             cur = Digest(stored.block.parent);
         }
+        let certificate = self.target.take().map(|t| t.2).unwrap_or_default();
         for digest in chain.into_iter().rev() {
             let block = &self.blocks[&digest].block;
             self.height += 1;
@@ -429,9 +436,10 @@ impl<E: Clock + Spawner> Actor<E> {
                 proposer: block.proposer,
                 digest: digest.0,
                 payload: block.payload.clone(),
+                // Only the target block is named by the certificate.
+                certificate: if digest == target { certificate.clone() } else { Vec::new() },
             });
         }
-        self.target = None;
         self.prune();
     }
 

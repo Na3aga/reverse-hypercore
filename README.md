@@ -144,7 +144,8 @@ chain in `--log`: balances, positions, open orders and EVM state carry over.
 scripts/multi-process.sh start      # 4 hc-validator processes; APIs on :8180-:8183, p2p on :9100-:9103
 scripts/multi-process.sh check      # every node's state hash at the same height
 scripts/multi-process.sh kill 3     # the other three keep finalizing (4 = 3f + 1 with f = 1)
-scripts/multi-process.sh resume     # restart all; node 3 first downloads the blocks it missed
+scripts/multi-process.sh revive 3   # node 3 catches up and rejoins while the others keep running
+scripts/multi-process.sh resume     # or restart all; a node that is behind downloads what it missed
 scripts/multi-process.sh stop
 ```
 
@@ -159,10 +160,17 @@ state, block log, snapshots, explorer and API. Nodes share only a genesis file
   starts consensus only once at least f other validators report the same
   state hash.
 
+**Rejoining a running chain** (`revive`, `hc-validator run --resume --rejoin`):
+the node catches up as above, then starts consensus from the **finalization
+certificate** of the last block it has (simplex's `Floor::Finalized`) instead
+of genesis. Every block's certificate and consensus digest are in the block
+log for this. Tested: after a revived node rejoins, killing a different node
+still leaves 3 voting validators, so the revived one is voting.
+
 The nodes could run on separate machines with the same flags (`--peers`,
-`--peer-apis`); this has only been tested on one machine. A single node cannot
-rejoin a chain that kept running without it: its consensus would start over
-from genesis. `resume` restarts every node together.
+`--peer-apis`); this has only been tested on one machine. A node can only catch
+up on blocks its peers still have in their logs, which go back to their last
+snapshot (2,000 blocks, a few minutes); fetching a peer's snapshot is not done.
 
 ## Performance
 
@@ -259,5 +267,5 @@ Replay and determinism coverage:
 ## Not included (MVP scope)
 - trailing stops, vaults, spot markets, HIP-3 markets, vault signing (`vaultAddress`), `expiresAfter`, and user-signed transfers (`usdSend`, `withdraw3`)
 - staking and validator set changes; the set is fixed at genesis
-- a single validator rejoining a chain that kept running without it
+- catching up from a peer's state snapshot (a node down for more than a snapshot interval cannot rejoin)
 - deployment across machines (supported by the flags, but only tested on one machine)

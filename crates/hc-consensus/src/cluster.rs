@@ -84,6 +84,8 @@ pub(crate) struct Common {
     pub block_interval: Duration,
     /// Expected one-way network delay (used to scale timeouts).
     pub expected_delay: Duration,
+    /// Encoded finalization certificate to start from instead of genesis.
+    pub floor: Option<Vec<u8>>,
 }
 
 struct Identities {
@@ -125,6 +127,20 @@ fn start_validator<E, S, R, B>(
     R: Receiver<PublicKey = PublicKey>,
     B: Blocker<PublicKey = PublicKey>,
 {
+    let scheme =
+        ed25519::Scheme::signer(NAMESPACE, ids.participants.clone(), ids.private[i].clone())
+            .expect("signer is a participant");
+    // Start from a finalized block (rejoining a running chain) or from genesis.
+    let floor = common.floor.as_ref().map(|bytes| {
+        use commonware_codec::Decode as _;
+        use commonware_cryptography::certificate::Verifier as _;
+        commonware_consensus::simplex::types::Finalization::<ed25519::Scheme, commonware_cryptography::sha256::Digest>::decode_cfg(
+            bytes.as_slice(),
+            &scheme.certificate_codec_config(),
+        )
+        .expect("floor certificate decodes")
+    });
+    let tip = floor.as_ref().map_or((0, GENESIS), |f| (commonware_consensus::Viewable::view(f).get(), f.proposal.payload));
     let (app, mailbox) = Actor::new(
         vctx.child("app"),
         actor::Config {
@@ -133,6 +149,7 @@ fn start_validator<E, S, R, B>(
             source: common.sources[i].clone(),
             sink: common.sinks[i].clone(),
             block_interval: common.block_interval,
+            tip,
         },
     );
     app.start(blocks);
@@ -142,9 +159,6 @@ fn start_validator<E, S, R, B>(
     let leader_timeout = (common.block_interval + rtt * 3).max(Duration::from_secs(1));
     let certification_timeout = leader_timeout + (rtt * 3).max(Duration::from_secs(1));
 
-    let scheme =
-        ed25519::Scheme::signer(NAMESPACE, ids.participants.clone(), ids.private[i].clone())
-            .expect("signer is a participant");
     let cfg = commonware_consensus::simplex::Config {
         scheme,
         elector: RoundRobin::<Sha256>::default(),
@@ -156,7 +170,7 @@ fn start_validator<E, S, R, B>(
         partition: format!("hc-consensus-v{i}"),
         mailbox_size: NZUsize!(1024),
         epoch: Epoch::zero(),
-        floor: Floor::Genesis(GENESIS),
+        floor: floor.map_or(Floor::Genesis(GENESIS), Floor::Finalized),
         replay_buffer: NZUsize!(1024 * 1024),
         write_buffer: NZUsize!(1024 * 1024),
         page_cache: CacheRef::from_pooler(vctx, NZU16!(1024), NZUsize!(10)),

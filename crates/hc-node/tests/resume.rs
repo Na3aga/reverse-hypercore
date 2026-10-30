@@ -27,7 +27,7 @@ fn block(h: u64) -> Finalized {
         })
         .collect();
     let body = BlockBody { time_ms: T0 + h * 100, txs, evm_txs: vec![] };
-    Finalized { view: h, height: h, proposer: (h % 4) as u32, digest: [0; 32], payload: body.encode() }
+    Finalized { view: h, height: h, proposer: (h % 4) as u32, digest: [0; 32], payload: body.encode(), certificate: vec![] }
 }
 
 /// State hashes after each of blocks 1..=n, executed directly.

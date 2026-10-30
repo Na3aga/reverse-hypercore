@@ -8,10 +8,9 @@
 #                                        # that was behind first downloads the blocks it missed)
 #   scripts/multi-process.sh check       # do all nodes have the same state hash?
 #   scripts/multi-process.sh kill <i>    # stop one node: the rest keep finalizing (n >= 3f + 1)
+#   scripts/multi-process.sh revive <i>  # restart it while the others run: it catches up from
+#                                        # its peers and rejoins from the last block's certificate
 #   scripts/multi-process.sh stop
-#
-# A single stopped node cannot rejoin a running chain yet (its consensus would
-# start over from genesis); `resume` restarts every node from its own log.
 #
 # Node i: API http://127.0.0.1:$((API_BASE + i)), p2p 127.0.0.1:$((P2P_BASE + i)),
 # files in run/multi/. Node 0 also runs the simulated market.
@@ -65,6 +64,7 @@ case "${1:-}" in
     for ((i = 0; i < n; i++)); do launch "$i" --resume; done
     ;;
   kill) stop_node "$2"; echo "node $2 stopped" ;;
+  revive) launch "$2" --resume --rejoin ;;
   stop) for ((i = 0; i < $(n_nodes); i++)); do stop_node "$i"; done; echo stopped ;;
   check)
     n=$(n_nodes)

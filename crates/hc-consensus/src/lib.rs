@@ -116,7 +116,7 @@ pub trait PayloadSource: Send + Sync + 'static {
 }
 
 /// A finalized block as observed by one validator.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub struct Finalized {
     /// Consensus view in which the block was proposed.
     pub view: u64,
@@ -128,6 +128,19 @@ pub struct Finalized {
     pub digest: [u8; 32],
     /// The application's opaque payload bytes.
     pub payload: Vec<u8>,
+    /// Encoded finalization certificate of this block, when a certificate
+    /// named it (empty for an ancestor finalized implicitly by a later
+    /// certificate). A validator can rejoin a running chain from it (see
+    /// [`LiveConfig::floor`]).
+    pub certificate: Vec<u8>,
+}
+
+/// Two validators finalize the same block with different certificates (each
+/// collects its own set of votes), so equality ignores the certificate.
+impl PartialEq for Finalized {
+    fn eq(&self, o: &Self) -> bool {
+        (self.view, self.height, self.proposer, self.digest, &self.payload) == (o.view, o.height, o.proposer, o.digest, &o.payload)
+    }
 }
 
 /// Configuration for [`run_deterministic`].
@@ -200,6 +213,7 @@ pub fn run_deterministic(
         sinks,
         block_interval: Duration::from_millis(cfg.block_interval_ms),
         expected_delay: Duration::from_millis(cfg.link_latency_ms + cfg.link_jitter_ms),
+        floor: None,
     };
     let links = cluster::SimLinks {
         latency: Duration::from_millis(cfg.link_latency_ms),
@@ -256,6 +270,11 @@ pub struct LiveConfig {
     /// `height_offset` blocks executed earlier. Consensus itself starts
     /// fresh (views from 0, new journals); only the numbering continues.
     pub height_offset: u64,
+    /// One validator per process only: start from this finalization
+    /// certificate (a [`Finalized::certificate`]) instead of genesis, to join
+    /// a chain whose other validators kept running. The application must
+    /// already have executed every block up to and including it.
+    pub floor: Option<Vec<u8>>,
 }
 
 impl Default for LiveConfig {
@@ -268,6 +287,7 @@ impl Default for LiveConfig {
             storage_dir: None,
             worker_threads: 2,
             height_offset: 0,
+            floor: None,
         }
     }
 }
@@ -335,6 +355,7 @@ where
         block_interval: Duration::from_millis(cfg.block_interval_ms),
         // Peers may be on other machines: allow for a real network round trip.
         expected_delay: Duration::from_millis(5),
+        floor: cfg.floor.clone(),
     };
     let runtime_cfg = cw_tokio::Config::new().with_worker_threads(cfg.worker_threads.max(1)).with_storage_directory(storage.clone());
     let thread = std::thread::Builder::new().name("hc-consensus".into()).spawn(move || {
@@ -422,6 +443,7 @@ where
         sinks,
         block_interval: Duration::from_millis(cfg.block_interval_ms),
         expected_delay: Duration::from_millis(1),
+        floor: None,
     };
     let runtime_cfg = cw_tokio::Config::new()
         .with_worker_threads(cfg.worker_threads.max(1))
