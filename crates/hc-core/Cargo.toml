@@ -1,0 +1,28 @@
+[package]
+name = "hc-core"
+description = "Deterministic HyperCore-like execution engine: order books, cross-margin clearinghouse, oracle, funding, liquidation."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+hc-evm = { path = "../hc-evm" }
+blake3.workspace = true
+k256 = { version = "0.13", features = ["ecdsa"] }
+# Signature recovery: libsecp256k1 (C), several times faster than k256 for recovery.
+secp256k1 = { version = "0.30", features = ["recovery", "global-context"] }
+rayon = "1.10"
+sha3 = "0.10"
+postcard = { version = "1", features = ["use-std"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+rand = "0.8"
+rand_chacha = "0.3"
