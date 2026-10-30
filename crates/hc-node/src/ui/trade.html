@@ -1,0 +1,938 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HC Devnet Terminal</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Crect width=%2716%27 height=%2716%27 rx=%273%27 fill=%27%23162033%27/%3E%3Cpath d=%27M3 11h2V6H3zm4 0h2V3H7zm4 0h2V8h-2z%27 fill=%27%23f0b54a%27/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "viem": "https://esm.sh/viem@2.21.55",
+    "viem/accounts": "https://esm.sh/viem@2.21.55/accounts",
+    "@noble/hashes/blake3": "https://esm.sh/@noble/hashes@1.6.1/blake3"
+  }
+}
+</script>
+<style>
+  :root {
+    --ground: #0f1726; --panel: #162033; --raise: #1c2940; --rule: #24324a;
+    --text: #dde6f3; --muted: #8394ae; --faint: #5b6b85;
+    --bid: #33c2a1; --ask: #ef6f7d; --tape: #f0b54a; --focus: #7fb2ff;
+    --r-s: 4px; --r-m: 8px;
+    font-family: "IBM Plex Sans", system-ui, sans-serif;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--ground); color: var(--text); min-height: 100vh; }
+  button, input, select { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+  a { color: var(--focus); text-decoration: none; }
+
+  /* Header: market + the block tape */
+  .top { display: grid; grid-template-columns: auto auto 1fr auto auto; gap: 18px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--rule); }
+  .brand { font-weight: 600; font-size: 15px; letter-spacing: .01em; }
+  .markets { display: flex; gap: 4px; }
+  .markets button { background: none; border: 1px solid var(--rule); border-radius: var(--r-s); padding: 4px 12px; cursor: pointer; }
+  .markets button[aria-pressed="true"] { background: var(--raise); border-color: var(--muted); }
+  .ticker { display: flex; gap: 22px; color: var(--muted); }
+  .ticker b { display: block; color: var(--text); font-weight: 500; font-size: 14px; }
+  .tape { display: flex; align-items: center; gap: 12px; }
+  .tape canvas { width: 220px; height: 30px; display: block; }
+  .tape .h { color: var(--tape); font-weight: 600; font-size: 14px; }
+  .tape small { color: var(--muted); display: block; }
+
+  /* Main grid */
+  .grid { display: grid; grid-template-columns: minmax(420px, 2.2fr) minmax(250px, 1fr) minmax(300px, 1.05fr); gap: 1px; background: var(--rule); border-bottom: 1px solid var(--rule); }
+  .pane { background: var(--panel); padding: 12px 14px; min-height: 420px; min-width: 0; }
+
+  /* Chart */
+  .chartpane { display: flex; flex-direction: column; }
+  .charthead { display: flex; align-items: center; gap: 14px; margin-bottom: 8px; flex-wrap: wrap; }
+  .intervals { display: flex; gap: 2px; }
+  .intervals button { background: none; border: 0; border-radius: var(--r-s); padding: 3px 8px; cursor: pointer; color: var(--muted); }
+  .intervals button[aria-pressed="true"] { background: var(--raise); color: var(--text); }
+  .ohlc { color: var(--muted); display: flex; gap: 10px; }
+  .ohlc b { color: var(--text); font-weight: 500; }
+  #chart { flex: 1; min-height: 440px; position: relative; }
+  .chartempty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); pointer-events: none; }
+
+  /* Book / trades switch */
+  .panetabs { display: flex; gap: 2px; margin: -4px 0 10px; }
+  .panetabs button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 4px 8px 6px; cursor: pointer; color: var(--muted); font-weight: 600; }
+  .panetabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--text); }
+  .pane h2 { font-size: 13px; font-weight: 600; margin: 0 0 10px; color: var(--text); }
+  .pane h2 span { color: var(--muted); font-weight: 400; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { color: var(--faint); font-weight: 500; text-align: right; padding: 3px 6px; }
+  td { text-align: right; padding: 2px 6px; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  .book tr { cursor: pointer; position: relative; }
+  .book td { position: relative; z-index: 1; }
+  .book tr:hover td { background: var(--raise); }
+  .bid { color: var(--bid); } .ask { color: var(--ask); } .muted { color: var(--muted); }
+  .spread { text-align: center; color: var(--muted); padding: 6px 0; border-block: 1px solid var(--rule); margin: 4px 0; }
+  .spread b { color: var(--text); font-size: 15px; font-weight: 500; }
+  .trades { max-height: 560px; overflow: auto; }
+
+  /* Ticket */
+  .seg { display: grid; grid-template-columns: 1fr 1fr; background: var(--ground); border-radius: var(--r-m); padding: 3px; gap: 3px; margin-bottom: 10px; }
+  .seg.kind { grid-template-columns: repeat(3, 1fr); }
+  .seg button { border: 0; background: none; border-radius: 6px; padding: 7px 0; cursor: pointer; color: var(--muted); }
+  .seg button[aria-pressed="true"] { background: var(--raise); color: var(--text); }
+  .seg.side button[data-v="buy"][aria-pressed="true"] { background: var(--bid); color: #062a22; font-weight: 600; }
+  .seg.side button[data-v="sell"][aria-pressed="true"] { background: var(--ask); color: #3a0a12; font-weight: 600; }
+  label.f { display: grid; grid-template-columns: 90px 1fr; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--muted); }
+  input[type=text], input[type=number], select { background: var(--ground); border: 1px solid var(--rule); border-radius: var(--r-s); padding: 7px 9px; width: 100%; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .submit { width: 100%; border: 0; border-radius: var(--r-m); padding: 10px; font-weight: 600; cursor: pointer; margin-top: 4px; }
+  .submit.buy { background: var(--bid); color: #062a22; } .submit.sell { background: var(--ask); color: #3a0a12; }
+  .submit:disabled { opacity: .5; cursor: progress; }
+  .acct { margin-top: 14px; border-top: 1px solid var(--rule); padding-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; }
+  .acct div { color: var(--muted); } .acct b { display: block; color: var(--text); font-weight: 500; font-size: 14px; }
+  .btn { background: var(--raise); border: 1px solid var(--rule); border-radius: var(--r-s); padding: 6px 10px; cursor: pointer; white-space: nowrap; }
+  .btn:hover { border-color: var(--muted); }
+  .funds { margin-top: 12px; display: grid; gap: 6px; }
+
+  /* Bottom tabs */
+  .tabs { display: flex; gap: 2px; padding: 0 16px; border-bottom: 1px solid var(--rule); }
+  .tabs button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 10px 12px; cursor: pointer; color: var(--muted); }
+  .tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--text); }
+  .tabpanel { padding: 10px 16px 40px; overflow-x: auto; }
+
+  .wallet { display: flex; gap: 8px; align-items: center; }
+  .wallet select { width: auto; }
+  .addr { color: var(--muted); }
+
+  /* Notifications: a bell with an unread count and a list of recent events */
+  .notify { position: relative; }
+  .bell { position: relative; display: grid; place-items: center; width: 34px; height: 34px; background: none; border: 1px solid var(--rule); border-radius: var(--r-m); cursor: pointer; color: var(--muted); }
+  .bell:hover, .bell[aria-expanded="true"] { color: var(--text); border-color: var(--muted); }
+  .bell svg { width: 17px; height: 17px; }
+  .badge { position: absolute; top: -6px; right: -6px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--tape); color: #2a1c02; font-size: 11px; font-weight: 600; line-height: 18px; text-align: center; }
+  @media (prefers-reduced-motion: no-preference) { .bell.ping svg { animation: ping .5s ease-out; } @keyframes ping { 30% { transform: rotate(14deg); } 60% { transform: rotate(-10deg); } } }
+  .npanel { position: absolute; right: 0; top: 42px; width: 360px; max-height: 70vh; display: flex; flex-direction: column; background: var(--raise); border: 1px solid var(--rule); border-radius: var(--r-m); box-shadow: 0 12px 36px rgba(0,0,0,.45); z-index: 20; }
+  .npanel header { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--rule); font-weight: 600; }
+  .npanel header button { background: none; border: 0; color: var(--focus); cursor: pointer; padding: 0; }
+  .nlist { overflow: auto; }
+  .nitem { padding: 8px 12px; border-bottom: 1px solid var(--rule); border-left: 3px solid transparent; }
+  .nitem.unread { background: color-mix(in srgb, var(--tape) 6%, transparent); }
+  .nitem.ok { border-left-color: var(--bid); } .nitem.err { border-left-color: var(--ask); }
+  .nitem small { display: flex; justify-content: space-between; color: var(--muted); margin-top: 2px; }
+  .nempty { padding: 18px 12px; color: var(--muted); }
+  .pxwrap { display: flex; gap: 6px; }
+  /* TP/SL in the ticket and on positions */
+  .tpsl { display: grid; gap: 6px; margin: -2px 0 10px; padding: 10px; background: var(--ground); border-radius: var(--r-m); }
+  .tpsl label { display: grid; grid-template-columns: 90px 1fr 74px; align-items: center; gap: 8px; color: var(--muted); }
+  .tpsl .hint { font-size: 12px; text-align: right; }
+  .tpslrow td { background: var(--raise); }
+  .tpslrow .tpsl { margin: 4px 0; grid-template-columns: 1fr 1fr auto; align-items: end; }
+  .tpslrow .tpsl label { grid-template-columns: auto 1fr; }
+  .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: 600; background: var(--raise); color: var(--muted); }
+  .tag.tp { color: var(--bid); } .tag.sl { color: var(--ask); }
+  .tag.long { background: color-mix(in srgb, var(--bid) 18%, transparent); color: var(--bid); }
+  .tag.short { background: color-mix(in srgb, var(--ask) 18%, transparent); color: var(--ask); }
+  /* Risk limits */
+  .riskform { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px 18px; max-width: 980px; }
+  .riskform label { display: grid; gap: 4px; color: var(--muted); }
+  .riskform small { color: var(--faint); }
+  .riskstatus { display: flex; gap: 22px; margin: 4px 0 14px; color: var(--muted); flex-wrap: wrap; }
+  .riskstatus b { display: block; color: var(--text); font-weight: 500; font-size: 14px; }
+  .banner { padding: 9px 12px; border-radius: var(--r-m); border-left: 3px solid var(--ask); background: color-mix(in srgb, var(--ask) 10%, transparent); margin-bottom: 12px; }
+  .pxwrap .btn { padding: 6px 9px; }
+
+  #toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 10; }
+  .toast { background: var(--raise); border: 1px solid var(--rule); border-left: 3px solid var(--muted); border-radius: var(--r-m); padding: 9px 12px; max-width: 380px; box-shadow: 0 6px 24px rgba(0,0,0,.35); }
+  .toast.ok { border-left-color: var(--bid); } .toast.err { border-left-color: var(--ask); }
+  .toast small { color: var(--tape); display: block; margin-top: 2px; }
+  @media (prefers-reduced-motion: no-preference) { .toast { animation: in .18s ease-out; } @keyframes in { from { transform: translateY(6px); opacity: 0; } } }
+
+  @media (max-width: 1180px) {
+    .grid { grid-template-columns: 1fr 1fr; }
+    .chartpane { grid-column: 1 / -1; }
+  }
+  @media (max-width: 980px) {
+    .npanel { position: fixed; left: 16px; right: 16px; top: 64px; width: auto; }
+    .grid { grid-template-columns: 1fr; }
+    #chart { min-height: 320px; }
+    .top { grid-template-columns: 1fr; }
+    .tape canvas { width: 100%; }
+  }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">HC Devnet</div>
+  <div class="markets" id="markets" role="group" aria-label="Market"></div>
+  <div class="ticker" id="ticker"></div>
+  <div class="tape" title="Each bar is a finalized block; height = time since the previous block">
+    <canvas id="tape" width="440" height="60" aria-hidden="true"></canvas>
+    <div><span class="h" id="height">—</span><small id="blockrate">waiting for blocks</small></div>
+  </div>
+  <div class="notify">
+    <button class="bell" id="bell" aria-label="Notifications" aria-expanded="false" aria-controls="npanel">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+      <span class="badge" id="badge" hidden>0</span>
+    </button>
+    <div class="npanel" id="npanel" hidden>
+      <header>Notifications <button id="nclear">Clear all</button></header>
+      <div class="nlist" id="nlist" aria-live="polite"></div>
+    </div>
+  </div>
+</header>
+
+<div class="grid">
+  <section class="pane chartpane" aria-label="Price chart">
+    <div class="charthead">
+      <div class="intervals" id="intervals" role="group" aria-label="Candle interval"></div>
+      <div class="ohlc" id="ohlc"></div>
+    </div>
+    <div id="chart"><div class="chartempty" id="chartempty">Waiting for the first trade</div></div>
+  </section>
+
+  <section class="pane" aria-label="Order book and trades">
+    <div class="panetabs" role="tablist">
+      <button role="tab" aria-selected="true" data-pane="book">Order book</button>
+      <button role="tab" aria-selected="false" data-pane="trades">Trades <span class="muted" id="tradecount"></span></button>
+    </div>
+    <div id="bookpane">
+      <table class="book"><thead><tr><th>Price</th><th>Size</th><th>Orders</th></tr></thead><tbody id="asks"></tbody></table>
+      <div class="spread" id="spread">—</div>
+      <table class="book"><tbody id="bids"></tbody></table>
+    </div>
+    <div id="tradespane" class="trades" hidden><table><thead><tr><th>Price</th><th>Size</th><th>Time</th></tr></thead><tbody id="trades"></tbody></table></div>
+  </section>
+
+  <section class="pane" aria-labelledby="ticketh">
+    <div class="row" style="justify-content: space-between; margin-bottom: 10px;">
+      <h2 id="ticketh" style="margin: 0;">Trade</h2>
+      <div class="wallet">
+        <select id="wallet" aria-label="Wallet">
+          <option value="alice">alice</option><option value="bob">bob</option><option value="carol">carol</option><option value="dave">dave</option>
+          <option value="custom">Private key…</option>
+        </select>
+        <span class="addr" id="addr"></span>
+      </div>
+    </div>
+    <div class="seg side" role="group" aria-label="Side">
+      <button data-v="buy" aria-pressed="true">Buy / long</button><button data-v="sell" aria-pressed="false">Sell / short</button>
+    </div>
+    <div class="seg kind" role="group" aria-label="Order type">
+      <button data-v="limit" aria-pressed="true">Limit</button><button data-v="market" aria-pressed="false">Market</button><button data-v="twap" aria-pressed="false">TWAP</button>
+    </div>
+    <div class="f" id="pxrow" style="display: grid; grid-template-columns: 90px 1fr; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--muted);">
+      <label for="px">Price</label>
+      <div class="pxwrap"><input id="px" type="text" inputmode="decimal" autocomplete="off"><button class="btn" id="pxmid" type="button" title="Use the current market price (book mid)">Mid</button></div>
+    </div>
+    <label class="f">Size <input id="sz" type="text" inputmode="decimal" autocomplete="off" placeholder="0.01"></label>
+    <label class="f" id="tifrow">Time in force
+      <select id="tif"><option value="Gtc">Good till cancel</option><option value="Alo">Post only</option><option value="Ioc">Immediate or cancel</option></select>
+    </label>
+    <div id="twaprow" hidden>
+      <label class="f">Duration <span class="pxwrap"><input id="twapm" type="number" min="1" max="1440" value="5" aria-label="TWAP duration in minutes"><span class="muted">min</span></span></label>
+      <label class="f">Randomize <input id="twaprand" type="checkbox" style="justify-self: start;"></label>
+      <p class="muted" id="twaphint" style="margin: -2px 0 10px;"></p>
+    </div>
+    <label class="f">Reduce only <input id="ro" type="checkbox" style="justify-self: start;"></label>
+    <label class="f" id="tpslrow">TP / SL <input id="tpslon" type="checkbox" style="justify-self: start;"></label>
+    <div class="tpsl" id="tpslbox" hidden>
+      <label>Take profit <input id="tppx" type="text" inputmode="decimal" autocomplete="off" placeholder="price"><span class="hint" id="tphint"></span></label>
+      <label>Stop loss <input id="slpx" type="text" inputmode="decimal" autocomplete="off" placeholder="price"><span class="hint" id="slhint"></span></label>
+    </div>
+    <button class="submit buy" id="submit">Place buy order</button>
+
+    <div class="acct">
+      <div>Account value<b id="av">—</b></div>
+      <div>Withdrawable<b id="wd">—</b></div>
+      <div>Margin used<b id="mu">—</b></div>
+      <div>EVM balance<b id="evmbal">—</b></div>
+    </div>
+    <div class="funds">
+      <div class="row"><label class="f" style="grid-template-columns: 90px 1fr; margin: 0; flex: 1; min-width: 0;">Leverage <input id="lev" type="number" min="1" value="20" style="min-width: 0;"></label><select id="mmode" aria-label="Margin mode" style="width: 96px; flex: none;"><option value="cross">Cross</option><option value="isolated">Isolated</option></select><button class="btn" id="setlev">Set</button></div>
+      <div class="row"><input id="amt" type="text" inputmode="decimal" value="1000" aria-label="USDC amount"><button class="btn" id="faucet">Get test USDC</button></div>
+      <div class="row"><button class="btn" id="toevm" style="flex: 1;">Move to EVM</button><button class="btn" id="tocore" style="flex: 1;">Move to core</button></div>
+      <label class="f" title="Small EVM blocks come every second with 2M gas; big ones every minute with 30M gas, for deployments and heavy calls.">Big EVM blocks <input id="bigblocks" type="checkbox" style="justify-self: start;"></label>
+      <div class="muted" id="fundsnote">Core and EVM share one address. Moves to EVM settle in the next block; moves to core in the next EVM block (each second).</div>
+    </div>
+  </section>
+</div>
+
+<nav class="tabs" role="tablist">
+  <button role="tab" aria-selected="true" data-tab="positions">Positions</button>
+  <button role="tab" aria-selected="false" data-tab="orders">Open orders</button>
+  <button role="tab" aria-selected="false" data-tab="twap">TWAP <span class="tag" id="twaptag" hidden></span></button>
+  <button role="tab" aria-selected="false" data-tab="fills">Fills</button>
+  <button role="tab" aria-selected="false" data-tab="activity">On-chain activity</button>
+  <button role="tab" aria-selected="false" data-tab="risk">Risk limits <span class="tag" id="risktag" hidden>halted</span></button>
+  <a href="/explorer" style="margin-left: auto; padding: 10px 0;" id="explorerlink">Open explorer</a>
+</nav>
+<div class="tabpanel" id="tabpanel" role="tabpanel"></div>
+<div id="toasts" aria-live="polite"></div>
+
+<script type="module">
+import { signAction, devKey, addressOf } from '/ui/hcsign.js';
+import { createWalletClient, http, parseEther, formatEther, defineChain } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+
+const $ = (s) => document.querySelector(s);
+const chain = defineChain({ id: 31337, name: 'HC devnet', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: [location.origin + '/evm'] } } });
+const BRIDGE = '0x2222222222222222222222222222222222222222';
+
+const S = { interval: '5s', coin: 'BTC', meta: null, side: 'buy', kind: 'limit', key: null, addr: null, book: null, ctx: null, mids: {}, blocks: [], tab: 'positions', acct: null, nextId: 1, pending: new Map(), myFills: new Map(), notes: [], unread: 0 };
+const fmt = (x, d = 2) => x == null || x === '' ? '—' : Number(x).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+const asset = () => S.meta.universe.findIndex((u) => u.name === S.coin);
+const szd = () => S.meta.universe[asset()].szDecimals;
+
+// Toasts are only for the user's own actions; at most three stay on screen.
+// Everything (including fills) also goes to the notification list.
+function toast(msg, cls = '', extra = '') {
+  const el = document.createElement('div');
+  el.className = `toast ${cls}`; el.innerHTML = `${msg}${extra ? `<small>${extra}</small>` : ''}`;
+  $('#toasts').append(el); setTimeout(() => el.remove(), 5000);
+  while ($('#toasts').children.length > 3) $('#toasts').firstElementChild.remove();
+  notify(msg, cls, extra, true);
+}
+function notify(msg, cls = '', extra = '', seen = false) {
+  S.notes.unshift({ msg, cls, extra, at: new Date(), unread: !seen });
+  S.notes.splice(100);
+  const open = !$('#npanel').hidden;
+  if (!seen && !open) {
+    S.unread++;
+    const bell = $('#bell'); bell.classList.remove('ping'); void bell.offsetWidth; bell.classList.add('ping');
+  }
+  renderNotes();
+}
+function renderNotes() {
+  $('#badge').hidden = !S.unread; $('#badge').textContent = S.unread > 99 ? '99+' : S.unread;
+  $('#bell').setAttribute('aria-label', S.unread ? `Notifications, ${S.unread} unread` : 'Notifications');
+  if ($('#npanel').hidden) return;
+  $('#nlist').innerHTML = S.notes.length ? S.notes.map((n) => `<div class="nitem ${n.cls}${n.unread ? ' unread' : ''}">${n.msg}<small><span>${n.extra}</span><span>${n.at.toLocaleTimeString()}</span></small></div>`).join('')
+    : '<div class="nempty">Nothing yet. Fills and order results show up here.</div>';
+}
+function toggleNotes(open = $('#npanel').hidden) {
+  $('#npanel').hidden = !open; $('#bell').setAttribute('aria-expanded', open);
+  if (open) { renderNotes(); S.unread = 0; S.notes.forEach((n) => n.unread = false); renderNotes(); }
+}
+// One notification per side and market for a batch of fills.
+function onFills(fills) {
+  const groups = new Map();
+  for (const f of fills) {
+    addMyFill(f);
+    const k = `${f.coin}|${f.side}|${f.liquidation}`;
+    const g = groups.get(k) ?? { f, n: 0, sz: 0, ntl: 0, fee: 0, pnl: 0 };
+    g.n++; g.sz += +f.sz; g.ntl += f.sz * f.px; g.fee += +f.fee; g.pnl += +f.closedPnl;
+    groups.set(k, g);
+  }
+  for (const { f, n, sz, ntl, fee, pnl } of groups.values()) {
+    const d = S.meta.universe.find((u) => u.name === f.coin)?.szDecimals ?? 4;
+    const msg = `${f.side === 'B' ? 'Bought' : 'Sold'} ${sz.toFixed(d)} ${f.coin} at ${fmt(ntl / sz, S.pxd ?? 1)}${n > 1 ? ` (${n} fills, average)` : ''}`;
+    const extra = `${f.liquidation ? 'Liquidation. ' : ''}fee ${fee.toFixed(2)} USDC${pnl ? `, closed PnL ${pnl.toFixed(2)}` : ''}`;
+    if (f.liquidation) toast(msg, 'err', extra); else notify(msg, 'ok', extra);
+  }
+  renderMarkers();
+}
+async function info(body) {
+  const r = await fetch('/info', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error((await r.json()).error); return r.json();
+}
+
+// ---- WebSocket ------------------------------------------------------------
+let ws;
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { resubscribe(); };
+  ws.onclose = () => setTimeout(connect, 800);
+  ws.onmessage = (m) => onMessage(JSON.parse(m.data));
+}
+const send = (o) => ws?.readyState === 1 && ws.send(JSON.stringify(o));
+let subs = [];
+function resubscribe() {
+  for (const s of subs) send({ method: 'unsubscribe', subscription: s });
+  subs = [{ type: 'blocks' }, { type: 'allMids' }, { type: 'l2Book', coin: S.coin }, { type: 'trades', coin: S.coin }, { type: 'candle', coin: S.coin, interval: S.interval }];
+  if (S.addr) subs.push({ type: 'userEvents', user: S.addr }, { type: 'orderUpdates', user: S.addr });
+  for (const s of subs) send({ method: 'subscribe', subscription: s });
+}
+function post(payload) {
+  const id = S.nextId++;
+  return new Promise((resolve) => { S.pending.set(id, resolve); send({ method: 'post', id, request: { type: 'action', payload } }); });
+}
+function onMessage(m) {
+  switch (m.channel) {
+    case 'l2Book': if (m.data.coin === S.coin) { S.book = m.data; renderBook(); } break;
+    case 'trades': renderTrades(m.data); break;
+    case 'candle': if (m.data.s === S.coin && m.data.i === S.interval) updateCandle(m.data); break;
+    case 'allMids': S.mids = m.data.mids; renderTicker(); break;
+    case 'blocks': onBlock(m.data); break;
+    case 'user':
+      if (m.data.fills?.length) onFills(m.data.fills);
+      if (m.data.twap && m.data.twap.status !== 'running') {
+        const t = m.data.twap, what = `TWAP ${t.side === 'B' ? 'buy' : 'sell'} ${t.sz} ${t.coin}`;
+        toast(`${what} ${t.status}`, t.status === 'canceled' ? '' : 'ok', t.status === 'activated' ? `${t.minutes} min, a slice every 30 s` : `${t.executedSz} filled${t.avgPx ? ` at ${fmt(t.avgPx, 1)} on average` : ''}`);
+      }
+      if (m.data.risk) toast(m.data.risk.kind === 'dailyLossHalt' ? 'Daily loss limit reached: only reducing orders until 00:00 UTC' : 'Margin limit reached: all positions closed at market', 'err', `account value ${fmt(m.data.risk.accountValue)} USDC`);
+      refreshAccount(); break;
+    case 'orderUpdates': onOrderUpdates(m.data); refreshAccount(); break;
+    case 'post': { const r = S.pending.get(m.data.id); if (r) { S.pending.delete(m.data.id); r(m.data.response.payload); } break; }
+  }
+}
+
+// TP/SL lifecycle notifications. Trigger orders are known from the open-orders list.
+S.triggers = new Map();
+function onOrderUpdates(ups) {
+  for (const u of ups) {
+    const t = S.triggers.get(u.order.oid);
+    if (!t) continue;
+    const what = `${t.tpsl === 'tp' ? 'Take profit' : 'Stop loss'} ${t.side === 'B' ? 'buy' : 'sell'} ${t.sz} ${t.coin}`;
+    if (u.status === 'triggered') toast(`${what} triggered`, t.tpsl === 'tp' ? 'ok' : 'err', `mark crossed ${fmt(t.triggerPx, S.pxd ?? 1)}`);
+    else if (u.status === 'siblingFilledCanceled') notify(`${what} cancelled`, '', 'its position closed or its entry was cancelled');
+  }
+}
+
+// ---- Chart --------------------------------------------------------------------
+const INTERVALS = ['1s', '5s', '15s', '1m', '5m', '15m', '1h', '4h'];
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+// Charts plot UTC seconds; shift so the axis shows local time.
+const tz = -new Date().getTimezoneOffset() * 60;
+const toBar = (c) => ({ time: Math.floor(c.t / 1000) + tz, open: +c.o, high: +c.h, low: +c.l, close: +c.c });
+const toVol = (c) => ({ time: Math.floor(c.t / 1000) + tz, value: +c.v, color: +c.c >= +c.o ? 'rgba(51,194,161,.35)' : 'rgba(239,111,125,.35)' });
+let chart, candles, volume, lastBar = null;
+function initChart() {
+  const el = $('#chart');
+  chart = LightweightCharts.createChart(el, {
+    autoSize: true,
+    layout: { background: { color: css('--panel') }, textColor: css('--muted'), fontFamily: 'IBM Plex Sans, system-ui, sans-serif', fontSize: 12 },
+    grid: { vertLines: { color: 'rgba(36,50,74,.6)' }, horzLines: { color: 'rgba(36,50,74,.6)' } },
+    rightPriceScale: { borderColor: css('--rule') },
+    timeScale: { borderColor: css('--rule'), timeVisible: true, secondsVisible: true, rightOffset: 4 },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  candles = chart.addCandlestickSeries({
+    upColor: css('--bid'), downColor: css('--ask'), borderVisible: false, wickUpColor: css('--bid'), wickDownColor: css('--ask'),
+  });
+  volume = chart.addHistogramSeries({ priceScaleId: 'vol', priceFormat: { type: 'volume' }, lastValueVisible: false, priceLineVisible: false });
+  chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  candles.priceScale().applyOptions({ scaleMargins: { top: 0.08, bottom: 0.22 } });
+  chart.subscribeCrosshairMove((p) => showOhlc(p?.seriesData?.get(candles) ?? lastBar));
+  $('#intervals').innerHTML = INTERVALS.map((i) => `<button data-i="${i}" aria-pressed="${i === S.interval}">${i}</button>`).join('');
+  document.querySelectorAll('#intervals button').forEach((b) => b.onclick = () => setInterval_(b.dataset.i));
+}
+function showOhlc(b) {
+  if (!b) { $('#ohlc').innerHTML = ''; return; }
+  const d = S.pxd ?? 1, up = b.close >= b.open, chg = ((b.close - b.open) / b.open * 100).toFixed(2);
+  $('#ohlc').innerHTML = `<span>${S.coin}</span><span>O <b>${fmt(b.open, d)}</b></span><span>H <b>${fmt(b.high, d)}</b></span><span>L <b>${fmt(b.low, d)}</b></span><span>C <b class="${up ? 'bid' : 'ask'}">${fmt(b.close, d)}</b></span><span class="${up ? 'bid' : 'ask'}">${up ? '+' : ''}${chg}%</span>`;
+}
+async function loadCandles() {
+  const coin = S.coin, interval = S.interval;
+  const cs = await info({ type: 'candleSnapshot', req: { coin, interval, startTime: 0, endTime: Date.now() + 3600e3 } });
+  if (coin !== S.coin || interval !== S.interval) return;
+  // Axis precision follows the market's tick: 5 significant figures.
+  const ref = cs.length ? +cs.at(-1).c : +(S.mids[coin] ?? 0);
+  const precision = ref ? Math.max(0, Math.min(6 - szd(), 4 - Math.floor(Math.log10(ref)))) : 2;
+  S.pxd = precision;
+  candles.applyOptions({ priceFormat: { type: 'price', precision, minMove: 10 ** -precision } });
+  candles.setData(cs.map(toBar)); volume.setData(cs.map(toVol));
+  S.firstBarMs = cs.length ? cs[0].t : Date.now();
+  renderMarkers(); renderPriceLines();
+  lastBar = cs.length ? toBar(cs.at(-1)) : null; showOhlc(lastBar);
+  $('#chartempty').hidden = cs.length > 0;
+  chart.timeScale().scrollToRealTime();
+}
+function updateCandle(c) {
+  const bar = toBar(c);
+  if (lastBar && bar.time < lastBar.time) return;
+  candles.update(bar); volume.update(toVol(c));
+  lastBar = bar; showOhlc(bar); $('#chartempty').hidden = true;
+}
+// Your fills as chart markers: one per candle and side, with the total size.
+const INTERVAL_MS = { '1s': 1e3, '5s': 5e3, '15s': 15e3, '1m': 6e4, '5m': 3e5, '15m': 9e5, '1h': 36e5, '4h': 144e5 };
+const addMyFill = (f) => S.myFills.set(`${f.tid}|${f.oid}`, f);
+function renderMarkers() {
+  if (!candles) return;
+  const ms = INTERVAL_MS[S.interval], first = S.firstBarMs ?? 0, buckets = new Map();
+  for (const f of S.myFills.values()) {
+    if (f.coin !== S.coin || f.time < first) continue;
+    const t = Math.floor(f.time / ms) * ms, k = `${t}|${f.side}`;
+    const b = buckets.get(k) ?? { t, side: f.side, sz: 0 };
+    b.sz += +f.sz; buckets.set(k, b);
+  }
+  const d = szd();
+  const markers = [...buckets.values()].sort((a, b) => a.t - b.t || (a.side < b.side ? -1 : 1)).map((b) => ({
+    time: Math.floor(b.t / 1000) + tz,
+    position: b.side === 'B' ? 'belowBar' : 'aboveBar',
+    shape: b.side === 'B' ? 'arrowUp' : 'arrowDown',
+    color: b.side === 'B' ? css('--bid') : css('--ask'),
+    text: `${b.side === 'B' ? 'B' : 'S'} ${+b.sz.toFixed(d)}`,
+  }));
+  candles.setMarkers(markers);
+}
+// Entry price of your position and your resting orders as price lines.
+let priceLines = [];
+function renderPriceLines() {
+  if (!candles || !S.acct) return;
+  for (const l of priceLines) candles.removePriceLine(l);
+  priceLines = [];
+  const pos = S.acct.core.assetPositions.map((p) => p.position).find((p) => p.coin === S.coin);
+  if (pos) priceLines.push(candles.createPriceLine({ price: +pos.entryPx, color: css('--tape'), lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: `Entry ${pos.szi}` }));
+  for (const o of S.acct.openOrders.filter((o) => o.coin === S.coin).slice(0, 20)) {
+    if (o.isTrigger) {
+      priceLines.push(candles.createPriceLine({ price: +o.triggerPx, color: o.tpsl === 'tp' ? css('--bid') : css('--ask'), lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: `${o.tpsl.toUpperCase()}${o.waitingForEntry ? ' (waiting)' : ''}` }));
+      continue;
+    }
+    priceLines.push(candles.createPriceLine({ price: +o.limitPx, color: o.side === 'B' ? css('--bid') : css('--ask'), lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: true, title: `${o.side === 'B' ? 'Buy' : 'Sell'} ${o.sz}` }));
+  }
+}
+
+function setInterval_(i) {
+  S.interval = i;
+  document.querySelectorAll('#intervals button').forEach((b) => b.setAttribute('aria-pressed', b.dataset.i === i));
+  try { localStorage.setItem('hc-interval', i); } catch {}
+  resubscribe(); loadCandles();
+}
+
+// ---- Block tape -------------------------------------------------------------
+let lastAcctRefresh = 0;
+function onBlock(b) {
+  const now = performance.now();
+  S.blocks.push({ h: b.height, t: now, n: b.nTxs });
+  if (S.blocks.length > 60) S.blocks.shift();
+  $('#height').textContent = `#${b.height}`;
+  const span = S.blocks.length > 1 ? (S.blocks.at(-1).t - S.blocks[0].t) / (S.blocks.length - 1) : 0;
+  $('#blockrate').textContent = span ? `${(1000 / span).toFixed(1)} blocks/s · ${Math.round(span)} ms avg` : 'live';
+  drawTape();
+  if (now - lastAcctRefresh > 700) { lastAcctRefresh = now; refreshAccount(); refreshCtx(); }
+}
+function drawTape() {
+  const c = $('#tape'), g = c.getContext('2d'), w = c.width, h = c.height;
+  g.clearRect(0, 0, w, h);
+  const bars = S.blocks.slice(-44), bw = w / 44;
+  bars.forEach((b, i) => {
+    const dt = i ? b.t - bars[i - 1].t : 100;
+    const bh = Math.max(6, Math.min(h, (dt / 400) * h));
+    g.fillStyle = b.n ? '#f0b54a' : 'rgba(240,181,74,.35)';
+    g.fillRect(i * bw + 1, h - bh, bw - 2, bh);
+  });
+}
+
+// ---- Market data --------------------------------------------------------------
+async function refreshCtx() {
+  const [meta, ctxs] = await info({ type: 'metaAndAssetCtxs' });
+  S.ctx = ctxs[asset()]; renderTicker();
+}
+function renderTicker() {
+  const c = S.ctx; if (!c) return;
+  const prem = Number(c.premium) * 100;
+  $('#ticker').innerHTML = `
+    <div>Mark<b>${fmt(c.markPx, 1)}</b></div><div>Oracle<b>${fmt(c.oraclePx, 1)}</b></div>
+    <div>Mid<b>${fmt(S.mids[S.coin] ?? c.midPx, 1)}</b></div><div>Open interest<b>${c.openInterest} ${S.coin}</b></div>
+    <div>Premium<b>${prem.toFixed(4)}%</b></div>`;
+}
+function renderBook() {
+  const [bids, asks] = S.book.levels, maxSz = Math.max(1e-9, ...[...bids, ...asks].map((l) => +l.sz));
+  const row = (l, cls) => {
+    const pct = (100 * l.sz / maxSz).toFixed(1);
+    const depth = `linear-gradient(to left, color-mix(in srgb, var(--${cls}) 16%, transparent) ${pct}%, transparent ${pct}%)`;
+    return `<tr data-px="${l.px}" style="background:${depth}"><td class="${cls}">${fmt(l.px, 1)}</td><td>${l.sz}</td><td class="muted">${l.n}</td></tr>`;
+  };
+  $('#asks').innerHTML = asks.slice(0, 12).reverse().map((l) => row(l, 'ask')).join('') || '<tr><td class="muted" colspan="3">No asks yet</td></tr>';
+  $('#bids').innerHTML = bids.slice(0, 12).map((l) => row(l, 'bid')).join('') || '<tr><td class="muted" colspan="3">No bids yet</td></tr>';
+  const b = bids[0]?.px, a = asks[0]?.px;
+  $('#spread').innerHTML = b && a ? `<b>${fmt((+a + +b) / 2, 1)}</b> spread ${fmt(a - b, 1)} (${((a - b) / a * 1e4).toFixed(1)} bps)`
+    : a || b ? `Only ${a ? 'asks' : 'bids'} so far` : 'Empty book. Place the first order';
+  document.querySelectorAll('.book tr[data-px]').forEach((tr) => tr.onclick = () => { $('#px').value = tr.dataset.px; setKind('limit'); });
+}
+const tradeRows = [];
+function renderTrades(ts) {
+  for (const t of ts) tradeRows.unshift(t);
+  tradeRows.splice(80);
+  const now = performance.now();
+  S.tradeLog = (S.tradeLog ?? []).filter((x) => now - x.t < 5000); S.tradeLog.push({ t: now, n: ts.length });
+  const span = Math.max(1000, now - S.tradeLog[0].t);
+  $('#tradecount').textContent = `${Math.round(S.tradeLog.reduce((a, x) => a + x.n, 0) / span * 1000)}/s`;
+  $('#trades').innerHTML = tradeRows.filter((t) => t.coin === S.coin).map((t) =>
+    `<tr><td class="${t.side === 'B' ? 'bid' : 'ask'}">${fmt(t.px, 1)}</td><td>${t.sz}</td><td class="muted">${new Date(t.time).toLocaleTimeString()}</td></tr>`).join('');
+}
+
+// ---- Account ------------------------------------------------------------------
+async function refreshAccount() {
+  if (!S.addr) return;
+  const d = await info({ type: 'explorerAddress', user: S.addr });
+  if (S.acct?.address !== d.address) { S.myFills.clear(); }
+  S.acct = d;
+  for (const o of d.openOrders) if (o.isTrigger) S.triggers.set(o.oid, o);
+  $('#risktag').hidden = !d.risk?.halted;
+  $('#twaptag').hidden = !d.twaps.length; $('#twaptag').textContent = d.twaps.length;
+  syncLeverage();
+  $('#bigblocks').checked = !!d.evm.usingBigBlocks;
+  const before = S.myFills.size;
+  for (const a of d.activity) if (a.kind === 'fill') addMyFill(a.detail);
+  if (S.myFills.size !== before) renderMarkers();
+  renderPriceLines();
+  const s = d.core.crossMarginSummary;
+  $('#av').textContent = `${fmt(s.accountValue)} USDC`; $('#wd').textContent = `${fmt(d.core.withdrawable)} USDC`;
+  $('#mu').textContent = `${fmt(s.totalMarginUsed)} USDC`; $('#evmbal').textContent = `${fmt(formatEther(BigInt(d.evm.balanceWei)))} USDC`;
+  renderTab();
+}
+// The panel is rebuilt on every account update; keep what the user is typing
+// (edited values, focus and cursor) across the rebuild.
+function renderTab() {
+  const el = $('#tabpanel'), act = document.activeElement;
+  const edited = [...el.querySelectorAll('input[id]')].filter((i) => i.value !== i.defaultValue).map((i) => [i.id, i.value]);
+  const focus = el.contains(act) && act.id ? { id: act.id, a: act.selectionStart, b: act.selectionEnd } : null;
+  renderTabContent();
+  for (const [id, v] of edited) { const i = el.querySelector('#' + id); if (i) { i.value = v; i.dispatchEvent(new Event('input')); } }
+  const f = focus && el.querySelector('#' + focus.id);
+  if (f && document.activeElement !== f) { f.focus(); try { f.setSelectionRange(focus.a, focus.b); } catch {} }
+}
+function renderTabContent() {
+  const d = S.acct, el = $('#tabpanel');
+  if (!d) { el.innerHTML = '<p class="muted">Choose a wallet to see positions and orders.</p>'; return; }
+  if (S.tab === 'positions') {
+    const ps = d.core.assetPositions;
+    const tpslOf = (coin) => d.openOrders.filter((o) => o.isTrigger && o.reduceOnly && o.coin === coin);
+    // Each TP/SL with its size when it covers only part of the position.
+    const tpslCell = (p) => {
+      const full = p.szi.replace('-', '');
+      const ts = tpslOf(p.coin).sort((x, y) => x.tpsl.localeCompare(y.tpsl) || +x.triggerPx - +y.triggerPx);
+      return ts.map((t) => `<span class="tag ${t.tpsl}">${t.tpsl.toUpperCase()}</span> ${fmt(t.triggerPx, 1)}${+t.sz < +full ? ` <span class="muted">× ${t.sz}</span>` : ''}`).join('<br>') || '<span class="muted">—</span>';
+    };
+    const marginEditor = (p) => `<tr class="tpslrow"><td colspan="11"><div class="tpsl">
+        <label>Isolated margin <input id="imamt" type="text" inputmode="decimal" placeholder="USDC"></label>
+        <div class="row"><button class="btn" id="imadd">Add from cross</button><button class="btn" id="imremove">Remove to cross</button><button class="btn" id="imclose">Close</button></div>
+        <div class="muted" style="grid-column: 1 / -1;">This position holds ${fmt(p.marginUsed)} USDC of its own margin. Its losses stop there, and it is liquidated at ${p.liquidationPx ? fmt(p.liquidationPx, 1) : '—'} without touching the rest of the account. Adding margin moves that price away; removing it is allowed down to the initial margin at ${p.leverage.value}×.</div>
+      </div></td></tr>`;
+    const editor = (p) => {
+      const full = p.szi.replace('-', ''), ts = tpslOf(p.coin);
+      return `<tr class="tpslrow"><td colspan="11"><div class="tpsl">
+        <label>Take profit <input id="ptp" type="text" inputmode="decimal" placeholder="price"></label>
+        <label>Stop loss <input id="psl" type="text" inputmode="decimal" placeholder="price"></label>
+        <label>Size <input id="psz" type="text" inputmode="decimal" value="${full}"></label>
+        <div class="row">${[25, 50, 75, 100].map((q) => `<button class="btn" data-pct="${q}">${q}%</button>`).join('')}</div>
+        <div class="row"><button class="btn" id="psave">Set for whole position</button><button class="btn" id="pcancel">Close</button></div>
+        ${ts.length ? `<div style="grid-column: 1 / -1;">${ts.map((t) => `<span class="row" style="display: inline-flex; margin-right: 14px;"><span class="tag ${t.tpsl}">${t.tpsl.toUpperCase()}</span> ${fmt(t.triggerPx, 1)} × ${t.sz} <button class="btn" data-rmtrig="${t.oid}" title="Remove">✕</button></span>`).join('')}</div>` : ''}
+        <div class="muted" style="grid-column: 1 / -1;">Each fires as a market order when the mark price crosses it. With the whole size, a new TP replaces the whole-size TP (and an SL the SL). With part of the size, it is added next to the existing ones, so you can scale out at several prices. Whatever is left is cancelled once the position closes; ✕ removes one now.</div>
+      </div></td></tr>`;
+    };
+    const marginCell = (p) => p.leverage.type === 'isolated'
+      ? `${fmt(p.marginUsed)} <button class="btn" data-margin="${p.coin}" title="Add or remove isolated margin">±</button>` : `<span class="muted">cross</span>`;
+    el.innerHTML = ps.length ? `<table><thead><tr><th>Market</th><th>Size</th><th>Entry</th><th>Value</th><th>Unrealized PnL</th><th>Liq. price</th><th>Leverage</th><th>Margin</th><th>Funding paid</th><th>TP / SL</th><th></th></tr></thead><tbody>${ps.map(({ position: p }) => `
+      <tr><td>${p.coin} <span class="tag ${+p.szi > 0 ? 'long' : 'short'}">${+p.szi > 0 ? 'Long' : 'Short'}</span></td><td class="${+p.szi > 0 ? 'bid' : 'ask'}">${p.szi.replace('-', '')} ${p.coin}</td><td>${fmt(p.entryPx, 1)}</td><td>${fmt(p.positionValue)}</td>
+      <td class="${+p.unrealizedPnl >= 0 ? 'bid' : 'ask'}">${fmt(p.unrealizedPnl)}</td><td>${p.liquidationPx ? fmt(p.liquidationPx, 1) : '—'}</td><td>${p.leverage.value}× ${p.leverage.type === 'isolated' ? '<span class="tag">isolated</span>' : ''}</td><td>${marginCell(p)}</td><td>${fmt(p.cumFunding.sinceOpen, 4)}</td>
+      <td>${tpslCell(p)}</td>
+      <td><div class="row" style="justify-content: flex-end;"><button class="btn" data-tpsl="${p.coin}">TP/SL</button><button class="btn" data-close="${p.coin}" data-szi="${p.szi}">Close at market</button></div></td></tr>
+      ${S.editTpsl === p.coin ? editor(p) : ''}${S.editMargin === p.coin ? marginEditor(p) : ''}`).join('')}</tbody></table>`
+      : '<p class="muted">No open positions. Place an order above to open one.</p>';
+    el.querySelectorAll('[data-close]').forEach((b) => b.onclick = () => closePosition(b.dataset.close, b.dataset.szi));
+    el.querySelectorAll('[data-margin]').forEach((b) => b.onclick = () => { S.editMargin = S.editMargin === b.dataset.margin ? null : b.dataset.margin; renderTab(); });
+    for (const dir of ['add', 'remove']) {
+      const b = $(`#im${dir}`);
+      if (b) b.onclick = () => updateIsolatedMargin(ps.map((x) => x.position).find((x) => x.coin === S.editMargin), dir === 'add' ? 1 : -1, $('#imamt').value.trim());
+    }
+    if ($('#imclose')) $('#imclose').onclick = () => { S.editMargin = null; renderTab(); };
+    el.querySelectorAll('[data-tpsl]').forEach((b) => b.onclick = () => { S.editTpsl = S.editTpsl === b.dataset.tpsl ? null : b.dataset.tpsl; renderTab(); });
+    if ($('#psave')) {
+      const p = ps.map((x) => x.position).find((x) => x.coin === S.editTpsl);
+      const full = p.szi.replace('-', ''), szDec = S.meta.universe.find((u) => u.name === p.coin).szDecimals;
+      const label = () => { const v = $('#psz').value.trim(); $('#psave').textContent = !v || +v >= +full ? 'Set for whole position' : `Add for ${v} ${p.coin}`; };
+      $('#psz').oninput = label;
+      el.querySelectorAll('[data-pct]').forEach((b) => b.onclick = () => {
+        $('#psz').value = b.dataset.pct === '100' ? full : (Math.floor(+full * b.dataset.pct / 100 * 10 ** szDec) / 10 ** szDec).toFixed(szDec);
+        label();
+      });
+      label();
+      $('#psave').onclick = () => savePositionTpsl(p, $('#ptp').value.trim(), $('#psl').value.trim(), $('#psz').value.trim());
+      $('#pcancel').onclick = () => { S.editTpsl = null; renderTab(); };
+      el.querySelectorAll('[data-rmtrig]').forEach((b) => b.onclick = async () => {
+        await act({ type: 'cancel', cancels: [{ a: S.meta.universe.findIndex((u) => u.name === p.coin), o: +b.dataset.rmtrig }] }, `Remove TP/SL on ${p.coin}`);
+        refreshAccount();
+      });
+    }
+  } else if (S.tab === 'orders') {
+    const os = d.openOrders;
+    el.innerHTML = os.length ? `<table><thead><tr><th>Market</th><th>Side</th><th>Price</th><th>Size</th><th>Type</th><th>Trigger</th><th>Order id</th><th></th></tr></thead><tbody>${os.map((o) => `
+      <tr><td>${o.coin}</td><td class="${o.side === 'B' ? 'bid' : 'ask'}">${o.side === 'B' ? 'Buy' : 'Sell'}</td><td>${o.isTrigger && o.isMarket ? 'Market' : fmt(o.limitPx, 1)}</td><td>${o.sz} / ${o.origSz}</td>
+      <td>${o.isTrigger ? `<span class="tag ${o.tpsl}">${o.orderType}</span>` : o.tif}${o.reduceOnly ? ' · reduce' : ''}</td>
+      <td class="muted">${o.isTrigger ? `${o.triggerCondition}${o.waitingForEntry ? ' · waiting for entry to fill' : ''}` : ''}</td><td>${o.oid}</td>
+      <td><button class="btn" data-cancel="${o.oid}" data-coin="${o.coin}">Cancel</button></td></tr>`).join('')}</tbody></table>`
+      : '<p class="muted">No open orders.</p>';
+    el.querySelectorAll('[data-cancel]').forEach((b) => b.onclick = () => cancel(b.dataset.coin, +b.dataset.cancel));
+  } else if (S.tab === 'fills') {
+    const fs = d.activity.filter((a) => a.kind === 'fill');
+    el.innerHTML = fs.length ? `<table><thead><tr><th>Block</th><th>Market</th><th>Direction</th><th>Price</th><th>Size</th><th>Fee</th><th>Closed PnL</th></tr></thead><tbody>${fs.map(({ height, detail: f }) => `
+      <tr><td><a href="/explorer#/block/${height}">${height}</a></td><td>${f.coin}</td><td>${f.dir}${f.adl && !f.liquidation ? ' (auto-deleveraged)' : f.liquidation ? ' (liquidation)' : ''}</td><td>${fmt(f.px, 1)}</td><td>${f.sz}</td><td>${f.fee}</td><td class="${+f.closedPnl >= 0 ? 'bid' : 'ask'}">${f.closedPnl}</td></tr>`).join('')}</tbody></table>`
+      : '<p class="muted">No fills yet.</p>';
+  } else if (S.tab === 'twap') {
+    const ts = d.twaps;
+    el.innerHTML = ts.length ? `<table><thead><tr><th>Market</th><th>Side</th><th>Filled / size</th><th>Average price</th><th>Slices</th><th>Ends</th><th></th></tr></thead><tbody>${ts.map((t) => `
+      <tr><td>${t.coin}</td><td class="${t.side === 'B' ? 'bid' : 'ask'}">${t.side === 'B' ? 'Buy' : 'Sell'}${t.reduceOnly ? ' · reduce' : ''}</td>
+      <td><progress max="${t.sz}" value="${t.executedSz}"></progress> ${t.executedSz} / ${t.sz}</td><td>${t.avgPx ? fmt(t.avgPx, 1) : '—'}</td>
+      <td>${t.slicesDone} / ${t.slices}${t.randomize ? ' · randomized' : ''}</td><td>${new Date(t.timestamp + t.minutes * 60000).toLocaleTimeString()}</td>
+      <td><button class="btn" data-twapcancel="${t.twapId}" data-coin="${t.coin}">Cancel</button></td></tr>`).join('')}</tbody></table>`
+      : '<p class="muted">No running TWAP orders. Choose TWAP in the order ticket to split a large order into a market slice every 30 seconds.</p>';
+    el.querySelectorAll('[data-twapcancel]').forEach((b) => b.onclick = () => act({ type: 'twapCancel', a: S.meta.universe.findIndex((u) => u.name === b.dataset.coin), t: +b.dataset.twapcancel }, `Cancel TWAP #${b.dataset.twapcancel}`));
+  } else if (S.tab === 'risk') {
+    renderRisk(el, d);
+  } else {
+    el.innerHTML = `<table><thead><tr><th>Block</th><th>Kind</th><th>Detail</th></tr></thead><tbody>${d.activity.slice(0, 60).map((a) => `
+      <tr><td><a href="/explorer#/block/${a.height}">${a.height}</a></td><td>${a.kind}</td><td style="text-align:left">${describe(a)}</td></tr>`).join('')}</tbody></table>
+      <p class="muted">Every row is in a finalized block. <a href="/explorer#/address/${S.addr}">See this address in the explorer</a>.</p>`;
+  }
+}
+function describe(a) {
+  const d = a.detail;
+  if (a.kind === 'ledger') return `${{ faucet: 'Received test USDC', coreToEvm: 'Moved to EVM', evmToCore: 'Moved to core', isolatedMargin: +d.usdc >= 0 ? 'Added isolated margin' : 'Removed isolated margin' }[d.kind] ?? d.kind}: ${d.usdc.replace('-', '')} USDC`;
+  if (a.kind === 'twap') return `TWAP ${d.side === 'B' ? 'buy' : 'sell'} ${d.sz} ${d.coin} ${d.status}${d.status === 'activated' ? ` (${d.minutes} min)` : `: ${d.executedSz} filled${d.avgPx ? ` at ${d.avgPx} on average` : ''}`}`;
+  if (a.kind === 'liquidation') return `${{ market: 'Liquidated at market', backstop: 'Taken over by the liquidator vault', adl: 'Auto-deleveraged (account below zero)' }[d.method] ?? d.method}; account value ${d.accountValue}`;
+  if (a.kind === 'fill') return `${d.dir} ${d.sz} ${d.coin} at ${d.px}`;
+  if (a.kind === 'evmTx') return `EVM transaction ${d.success ? 'succeeded' : 'reverted'}, value ${formatEther(BigInt(d.valueWei))} USDC`;
+  if (a.kind === 'evmTransferIn') return `Received ${formatEther(BigInt(d.valueWei))} USDC on EVM`;
+  if (a.kind === 'action') return d.action.type;
+  if (a.kind === 'funding') return `Funding ${d.coin}: ${d.usdc} USDC`;
+  if (a.kind === 'risk') return d.kind === 'dailyLossHalt' ? `Daily loss limit reached (account value ${d.accountValue})` : `Margin limit reached: positions closed (account value ${d.accountValue})`;
+  return JSON.stringify(d);
+}
+
+// ---- Risk limits ------------------------------------------------------------------
+function renderRisk(el, d) {
+  if (S.riskDraft && el.contains(document.activeElement)) return; // keep what the user is typing
+  const r = d.risk ?? {};
+  const pnl = r.dayPnl != null ? +r.dayPnl : null;
+  el.innerHTML = `
+    ${r.halted ? '<div class="banner">Daily loss limit reached. Only orders that reduce a position are accepted until 00:00 UTC.</div>' : ''}
+    <div class="riskstatus">
+      <div>Today's PnL<b class="${pnl == null ? '' : pnl >= 0 ? 'bid' : 'ask'}">${pnl == null ? '—' : `${pnl >= 0 ? '+' : ''}${fmt(pnl)} USDC`}</b></div>
+      <div>Value at 00:00 UTC<b>${r.dayStartValue ? `${fmt(r.dayStartValue)} USDC` : '—'}</b></div>
+      <div>Margin used / account value<b>${fmt(100 * d.core.crossMarginSummary.totalMarginUsed / Math.max(1, d.core.crossMarginSummary.accountValue), 1)}%</b></div>
+    </div>
+    <div class="riskform">
+      <label>Max position per market (USD)<input id="rk-pos" type="text" inputmode="decimal" value="${r.maxPositionUsd ?? ''}" placeholder="no limit"><small>Orders that would grow a position past this are rejected.</small></label>
+      <label>Max leverage<input id="rk-lev" type="number" min="1" value="${r.maxLeverage ?? ''}" placeholder="no limit"><small>Also lowers current leverage settings above it.</small></label>
+      <label>Daily loss limit (USD)<input id="rk-loss" type="text" inputmode="decimal" value="${r.dailyLossUsd ?? ''}" placeholder="no limit"><small>Past this loss since 00:00 UTC, only reducing orders until the next day.</small></label>
+      <label>Close all at margin (%)<input id="rk-mm" type="number" min="1" max="99" value="${r.closeAtMarginPct ?? ''}" placeholder="off"><small>Closes every position at market when maintenance margin reaches this share of account value. Liquidation is at 100%.</small></label>
+    </div>
+    <div class="row" style="margin-top: 14px;"><button class="btn" id="rk-save">Save limits</button><button class="btn" id="rk-clear">Remove all limits</button>
+    <span class="muted">Enforced by the chain for this account. Changes apply in the next block.</span></div>`;
+  el.querySelectorAll('.riskform input').forEach((i) => i.oninput = () => { S.riskDraft = true; });
+  const val = (id) => $(id).value.trim() || null;
+  $('#rk-save').onclick = async () => {
+    S.riskDraft = false;
+    const lev = val('#rk-lev'), mm = val('#rk-mm');
+    await act({ type: 'setRiskLimits', maxPositionUsd: val('#rk-pos'), maxLeverage: lev && +lev, dailyLossUsd: val('#rk-loss'), closeAtMarginPct: mm && +mm }, 'Risk limits');
+  };
+  $('#rk-clear').onclick = async () => { S.riskDraft = false; await act({ type: 'setRiskLimits' }, 'Remove risk limits'); };
+}
+
+// ---- TP/SL ---------------------------------------------------------------------------
+// A reduce-only market trigger on the closing side. Its price field is the
+// worst acceptable price; the engine uses mark ± 10% when it fires.
+function tpslOrder(a, closeIsBuy, trigger, sz, tpsl, szDec) {
+  const worst = roundPx(trigger * (closeIsBuy ? 1.1 : 0.9), szDec);
+  return { a, b: closeIsBuy, p: worst, s: sz, r: true, t: { trigger: { isMarket: true, triggerPx: roundPx(trigger, szDec), tpsl } } };
+}
+function tpslHints() {
+  const isBuy = S.side === 'buy', on = $('#tpslon').checked;
+  $('#tpslbox').hidden = !on;
+  if (!on) return;
+  const ref = S.kind === 'limit' && +$('#px').value ? +$('#px').value : +(S.mids[S.coin] ?? S.ctx?.markPx);
+  const sz = +$('#sz').value || 0;
+  const hint = (v, el, good) => {
+    if (!v || !ref) { el.textContent = ''; return; }
+    const pct = (v / ref - 1) * 100 * (isBuy ? 1 : -1), pnl = (v - ref) * sz * (isBuy ? 1 : -1);
+    const wrong = good ? pct <= 0 : pct >= 0;
+    el.className = `hint ${wrong ? 'ask' : pnl >= 0 ? 'bid' : 'ask'}`;
+    el.textContent = wrong
+      ? `must be ${good === isBuy ? 'above' : 'below'} entry`
+      : `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%${sz ? ` (${pnl >= 0 ? '+' : ''}${fmt(pnl, 0)})` : ''}`;
+  };
+  hint(+$('#tppx').value, $('#tphint'), true);
+  hint(+$('#slpx').value, $('#slhint'), false);
+}
+// The whole size replaces the position's whole-size TP (or SL); part of it adds a level.
+async function savePositionTpsl(p, tp, sl, size) {
+  const a = S.meta.universe.findIndex((u) => u.name === p.coin), szDec = S.meta.universe[a].szDecimals;
+  const closeIsBuy = +p.szi < 0, full = p.szi.replace('-', ''), mark = +(S.mids[p.coin] ?? S.ctx?.markPx);
+  const partial = size && +size < +full, sz = partial ? size : full;
+  if (!tp && !sl) { toast('Enter a take-profit or stop-loss price.', 'err'); return; }
+  if (!(+sz > 0)) { toast('Size must be more than 0.', 'err'); return; }
+  if (tp && (closeIsBuy ? +tp >= mark : +tp <= mark)) { toast(`Take profit must be ${closeIsBuy ? 'below' : 'above'} the current price.`, 'err'); return; }
+  if (sl && (closeIsBuy ? +sl <= mark : +sl >= mark)) { toast(`Stop loss must be ${closeIsBuy ? 'above' : 'below'} the current price.`, 'err'); return; }
+  const replaces = (o) => (tp && o.tpsl === 'tp') || (sl && o.tpsl === 'sl');
+  const old = partial ? [] : S.acct.openOrders.filter((o) => o.isTrigger && o.reduceOnly && o.coin === p.coin && +o.sz >= +full && replaces(o));
+  if (old.length) await act({ type: 'cancel', cancels: old.map((o) => ({ a, o: o.oid })) }, `Replace TP/SL on ${p.coin}`);
+  const orders = [];
+  if (tp) orders.push(tpslOrder(a, closeIsBuy, +tp, sz, 'tp', szDec));
+  if (sl) orders.push(tpslOrder(a, closeIsBuy, +sl, sz, 'sl', szDec));
+  if (orders.length) await act({ type: 'order', orders, grouping: 'positionTpsl' }, `TP/SL on ${p.coin}${partial ? ` for ${sz}` : ''}`);
+  if (!partial) S.editTpsl = null;
+  refreshAccount();
+}
+
+// ---- Actions --------------------------------------------------------------------
+async function act(action, label) {
+  if (!S.key) { toast('Choose a wallet first.', 'err'); return null; }
+  const t0 = performance.now();
+  const res = await post(await signAction(S.key, action));
+  const ms = Math.round(performance.now() - t0);
+  if (res.status !== 'ok') { toast(`${label} failed: ${res.response}`, 'err'); return null; }
+  const st = res.response.data?.statuses?.[0];
+  const childErr = res.response.data?.statuses?.slice(1).find((x) => x?.error);
+  if (childErr) toast(`${label}: ${childErr.error}`, 'err');
+  if (st?.error) toast(`${label}: ${st.error}`, 'err', `rejected on-chain in ${ms} ms`);
+  else {
+    const twap = res.response.data?.status?.running?.twapId;
+    toast(`${label}: ${st?.filled ? `filled ${st.filled.totalSz} at ${st.filled.avgPx}` : st?.resting ? `resting as #${st.resting.oid}` : twap ? `running as TWAP #${twap}` : 'done'}`, 'ok', `finalized and executed in ${ms} ms`);
+  }
+  refreshAccount();
+  return res;
+}
+function roundPx(p, szDec) {
+  if (p >= 1e5) return String(Math.round(p));
+  const decimals = Math.max(0, 6 - szDec);
+  const v = Number(p.toPrecision(5));
+  return String(Number(v.toFixed(decimals)));
+}
+async function submit() {
+  const isBuy = S.side === 'buy', sz = $('#sz').value.trim();
+  if (S.kind === 'twap') {
+    const m = +$('#twapm').value;
+    if (!sz || !m) { toast('Enter a size and a duration.', 'err'); return; }
+    $('#submit').disabled = true;
+    try {
+      await act({ type: 'twapOrder', twap: { a: asset(), b: isBuy, s: sz, r: $('#ro').checked, m, t: $('#twaprand').checked } }, `TWAP ${isBuy ? 'buy' : 'sell'} ${sz} ${S.coin} over ${m} min`);
+    } finally { $('#submit').disabled = false; }
+    return;
+  }
+  let px = $('#px').value.trim(), tif = $('#tif').value;
+  if (S.kind === 'market') {
+    const ref = +(S.mids[S.coin] ?? S.ctx?.markPx);
+    px = roundPx(ref * (isBuy ? 1.05 : 0.95), szd()); tif = 'Ioc';
+  }
+  if (!px || !sz) { toast('Enter a price and a size.', 'err'); return; }
+  const orders = [{ a: asset(), b: isBuy, p: px, s: sz, r: $('#ro').checked, t: { limit: { tif } } }];
+  if ($('#tpslon').checked) {
+    const tp = +$('#tppx').value, sl = +$('#slpx').value;
+    const ref = S.kind === 'limit' ? +px : +(S.mids[S.coin] ?? S.ctx?.markPx);
+    if (tp && (isBuy ? tp <= ref : tp >= ref)) { toast(`Take profit must be ${isBuy ? 'above' : 'below'} the entry price.`, 'err'); return; }
+    if (sl && (isBuy ? sl >= ref : sl <= ref)) { toast(`Stop loss must be ${isBuy ? 'below' : 'above'} the entry price.`, 'err'); return; }
+    if (tp) orders.push(tpslOrder(asset(), !isBuy, tp, sz, 'tp', szd()));
+    if (sl) orders.push(tpslOrder(asset(), !isBuy, sl, sz, 'sl', szd()));
+  }
+  $('#submit').disabled = true;
+  try {
+    const label = `${isBuy ? 'Buy' : 'Sell'} ${sz} ${S.coin}${orders.length > 1 ? ` with ${orders.slice(1).map((o) => o.t.trigger.tpsl.toUpperCase()).join(' + ')}` : ''}`;
+    await act({ type: 'order', orders, grouping: orders.length > 1 ? 'normalTpsl' : 'na' }, label);
+  } finally { $('#submit').disabled = false; }
+}
+async function updateIsolatedMargin(p, sign, amt) {
+  if (!(+amt > 0)) { toast('Enter an amount of USDC.', 'err'); return; }
+  const a = S.meta.universe.findIndex((u) => u.name === p.coin);
+  const ntli = sign * Math.round(+amt * 1e6);
+  await act({ type: 'updateIsolatedMargin', asset: a, isBuy: +p.szi > 0, ntli }, `${sign > 0 ? 'Add' : 'Remove'} ${amt} USDC ${sign > 0 ? 'to' : 'from'} ${p.coin} margin`);
+}
+// The leverage controls show the current market's setting unless being edited.
+function syncLeverage() {
+  if (!S.acct || ['lev', 'mmode'].includes(document.activeElement?.id)) return;
+  const l = S.acct.core.assetLeverage?.find((x) => x.coin === S.coin);
+  if (l) { $('#lev').value = l.value; $('#mmode').value = l.type; }
+}
+function twapHint() {
+  const m = +$('#twapm').value, sz = +$('#sz').value, n = Math.max(1, m * 2);
+  $('#twaphint').textContent = m ? `A market slice every 30 s: ${n} slices${sz ? ` of about ${(sz / n).toFixed(szd())} ${S.coin}` : ''}, each within 3% of the mark price.` : '';
+}
+async function closePosition(coin, szi) {
+  const a = S.meta.universe.findIndex((u) => u.name === coin), isBuy = +szi < 0;
+  const ref = +(S.mids[coin] ?? S.ctx?.markPx);
+  await act({ type: 'order', orders: [{ a, b: isBuy, p: roundPx(ref * (isBuy ? 1.05 : 0.95), S.meta.universe[a].szDecimals), s: szi.replace('-', ''), r: true, t: { limit: { tif: 'Ioc' } } }] }, `Close ${coin}`);
+}
+const cancel = (coin, oid) => act({ type: 'cancel', cancels: [{ a: S.meta.universe.findIndex((u) => u.name === coin), o: oid }] }, `Cancel #${oid}`);
+
+async function toCore() {
+  const amt = $('#amt').value.trim();
+  try {
+    const wallet = createWalletClient({ account: privateKeyToAccount(S.key), chain, transport: http() });
+    const t0 = performance.now();
+    const hash = await wallet.sendTransaction({ to: BRIDGE, value: parseEther(amt), gasPrice: 0n, type: 'legacy' });
+    toast(`Moving ${amt} USDC to core`, '', `EVM tx ${hash.slice(0, 10)}… submitted in ${Math.round(performance.now() - t0)} ms`);
+    setTimeout(refreshAccount, 600);
+  } catch (e) { toast(`Move to core failed: ${e.shortMessage ?? e.message}`, 'err'); }
+}
+
+// ---- Wiring ----------------------------------------------------------------------
+function setKind(k) {
+  S.kind = k;
+  document.querySelectorAll('.seg.kind button').forEach((b) => b.setAttribute('aria-pressed', b.dataset.v === k));
+  $('#pxrow').hidden = k !== 'limit'; $('#tifrow').hidden = k !== 'limit';
+  $('#twaprow').hidden = k !== 'twap'; $('#tpslrow').hidden = k === 'twap';
+  if (k === 'twap') { $('#tpslon').checked = false; tpslHints(); twapHint(); }
+  setSide(S.side);
+}
+function setSide(s) {
+  S.side = s;
+  document.querySelectorAll('.seg.side button').forEach((b) => b.setAttribute('aria-pressed', b.dataset.v === s));
+  $('#submit').className = `submit ${s}`; $('#submit').textContent = S.kind === 'twap' ? `Start ${s} TWAP` : `Place ${s} order`;
+}
+function setWallet(name) {
+  let key = name === 'custom' ? prompt('Private key (0x…)') : devKey(name);
+  if (!key) { $('#wallet').value = 'alice'; key = devKey('alice'); }
+  S.key = key; S.addr = addressOf(key);
+  $('#addr').textContent = `${S.addr.slice(0, 6)}…${S.addr.slice(-4)}`; $('#addr').title = S.addr;
+  $('#explorerlink').href = `/explorer#/address/${S.addr}`;
+  try { localStorage.setItem('hc-wallet', name === 'custom' ? 'alice' : name); } catch {}
+  resubscribe(); refreshAccount();
+}
+function setCoin(c) {
+  S.coin = c; S.book = null; $('#trades').innerHTML = ''; tradeRows.length = 0; lastBar = null;
+  document.querySelectorAll('#markets button').forEach((b) => b.setAttribute('aria-pressed', b.dataset.c === c));
+  $('#sz').placeholder = c === 'BTC' ? '0.01' : '0.1';
+  resubscribe(); refreshCtx(); loadCandles(); syncLeverage(); twapHint();
+}
+
+document.querySelectorAll('.panetabs [role=tab]').forEach((b) => b.onclick = () => {
+  document.querySelectorAll('.panetabs [role=tab]').forEach((x) => x.setAttribute('aria-selected', x === b));
+  $('#bookpane').hidden = b.dataset.pane !== 'book'; $('#tradespane').hidden = b.dataset.pane !== 'trades';
+});
+document.querySelectorAll('.seg.side button').forEach((b) => b.onclick = () => setSide(b.dataset.v));
+document.querySelectorAll('.seg.kind button').forEach((b) => b.onclick = () => setKind(b.dataset.v));
+document.querySelectorAll('.tabs [role=tab]').forEach((b) => b.onclick = () => {
+  S.tab = b.dataset.tab; document.querySelectorAll('.tabs [role=tab]').forEach((x) => x.setAttribute('aria-selected', x === b)); renderTab();
+});
+$('#submit').onclick = submit;
+['#tpslon', '#tppx', '#slpx', '#px', '#sz'].forEach((id) => $(id).addEventListener('input', tpslHints));
+document.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', tpslHints));
+$('#pxmid').onclick = () => {
+  const b = S.book?.levels[0][0]?.px, a = S.book?.levels[1][0]?.px;
+  const ref = b && a ? (+a + +b) / 2 : +(S.mids[S.coin] ?? S.ctx?.markPx);
+  if (!ref) { toast('No market price yet.', 'err'); return; }
+  $('#px').value = roundPx(ref, szd()); $('#px').focus();
+};
+$('#bell').onclick = (e) => { e.stopPropagation(); toggleNotes(); };
+$('#nclear').onclick = () => { S.notes = []; S.unread = 0; renderNotes(); };
+document.addEventListener('click', (e) => { if (!$('#npanel').hidden && !e.target.closest('.notify')) toggleNotes(false); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('#npanel').hidden) { toggleNotes(false); $('#bell').focus(); } });
+$('#wallet').onchange = (e) => setWallet(e.target.value);
+$('#setlev').onclick = () => act({ type: 'updateLeverage', asset: asset(), isCross: $('#mmode').value === 'cross', leverage: +$('#lev').value }, `Leverage ${$('#lev').value}× ${$('#mmode').value} on ${S.coin}`);
+['#twapm', '#sz'].forEach((id) => $(id).addEventListener('input', twapHint));
+$('#faucet').onclick = () => act({ type: 'faucet', usd: $('#amt').value.trim() }, `Faucet ${$('#amt').value} USDC`);
+$('#toevm').onclick = () => act({ type: 'sendToEvm', usd: $('#amt').value.trim() }, `Move ${$('#amt').value} USDC to EVM`);
+$('#tocore').onclick = toCore;
+$('#bigblocks').onchange = (e) => act({ type: 'evmUserModify', usingBigBlocks: e.target.checked }, e.target.checked ? 'Use big EVM blocks' : 'Use small EVM blocks');
+
+S.meta = await info({ type: 'meta' });
+$('#markets').innerHTML = S.meta.universe.map((u) => `<button data-c="${u.name}" aria-pressed="false">${u.name}-USDC</button>`).join('');
+document.querySelectorAll('#markets button').forEach((b) => b.onclick = () => setCoin(b.dataset.c));
+let saved = 'alice'; try { saved = localStorage.getItem('hc-wallet') || 'alice'; S.interval = localStorage.getItem('hc-interval') || S.interval; } catch {}
+if (!INTERVALS.includes(S.interval)) S.interval = '5s';
+initChart();
+$('#wallet').value = saved;
+connect();
+setCoin('BTC');
+setWallet(saved);
+</script>
+</body>
+</html>

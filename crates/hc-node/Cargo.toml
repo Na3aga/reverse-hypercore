@@ -1,0 +1,29 @@
+[package]
+name = "hc-node"
+description = "4-validator devnet node: mempool, oracle feeders, executor, WebSocket API."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive"] }
+hc-evm = { path = "../hc-evm" }
+futures = "0.3"
+hc-consensus = { path = "../hc-consensus" }
+hc-core = { path = "../hc-core" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rand = "0.8"
+rand_chacha = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+rayon = "1.10"
+blake3 = "1"
+postcard = { version = "1", features = ["use-std"] }
+tokio.workspace = true
+tokio-tungstenite = "0.26"
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]

@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HC Explorer</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Crect width=%2716%27 height=%2716%27 rx=%273%27 fill=%27%23162033%27/%3E%3Cpath d=%27M3 11h2V6H3zm4 0h2V3H7zm4 0h2V8h-2z%27 fill=%27%23f0b54a%27/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #2a313c; --text: #e6edf3; --muted: #8b949e;
+    --accent: #50d2c1; --good: #3fb950; --bad: #f85149; --warn: #d29922;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, system-ui, sans-serif; }
+  header { display: flex; gap: 16px; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; color: var(--accent); cursor: pointer; }
+  header input { flex: 1; min-width: 220px; background: var(--panel); border: 1px solid var(--line); color: var(--text); padding: 8px 10px; border-radius: 6px; font-family: var(--mono); }
+  main { padding: 16px 20px; max-width: 1280px; margin: 0 auto; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .stat .k { color: var(--muted); font-size: 12px; }
+  .stat .v { font-family: var(--mono); font-size: 15px; margin-top: 2px; overflow-wrap: anywhere; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 16px; overflow-x: auto; }
+  section h2 { font-size: 14px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; }
+  a { color: var(--accent); text-decoration: none; cursor: pointer; }
+  .ok { color: var(--good); } .err { color: var(--bad); } .muted { color: var(--muted); }
+  pre { margin: 0; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; border: 1px solid var(--line); }
+  .pill.evm { color: #a371f7; border-color: #a371f7; } .pill.core { color: var(--accent); border-color: var(--accent); }
+  .pill.ok { color: var(--good); border-color: var(--good); } .pill.err { color: var(--bad); border-color: var(--bad); } .pill.warn { color: var(--warn); border-color: var(--warn); }
+  .kv { display: grid; grid-template-columns: minmax(130px, 210px) 1fr; font-size: 13px; }
+  .kv > div { padding: 8px 4px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+  .kv > .k { color: var(--muted); }
+  .kv .mono, td.mono { font-family: var(--mono); font-size: 12.5px; }
+  .kv > .gap { grid-column: 1 / -1; padding: 0; border-bottom: 1px solid var(--line); height: 8px; }
+  .tabs { display: flex; gap: 4px; margin: 0 0 10px; flex-wrap: wrap; }
+  .tabs button { background: none; border: 1px solid var(--line); color: var(--muted); padding: 5px 12px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 13px; }
+  .tabs button.on { color: var(--text); border-color: var(--accent); background: #50d2c11a; }
+  .steps { margin: 0; padding-left: 20px; font-size: 13px; } .steps li { padding: 3px 0; }
+  .buy { color: var(--good); } .sell { color: var(--bad); }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  details summary { cursor: pointer; color: var(--muted); }
+  @media (max-width: 640px) { header, main { padding-left: 16px; padding-right: 16px; } .kv { grid-template-columns: 1fr; } .kv > .k { border-bottom: none; padding-bottom: 0; } }
+</style>
+</head>
+<body>
+<header>
+  <h1 onclick="go('#/')">HC Explorer</h1>
+  <a href="/">Trade</a>
+  <input id="q" placeholder="Search address (0x…40), tx hash (0x…64) or block height" onkeydown="if(event.key==='Enter')search()">
+</header>
+<main id="app"></main>
+<script>
+const $ = (s) => document.querySelector(s);
+const short = (h, n = 10) => h && h.length > 2 * n ? h.slice(0, n) + '…' + h.slice(-6) : (h ?? '');
+const ts = (ms) => new Date(ms).toISOString().replace('T', ' ').replace('Z', '');
+const wei = (w) => { if (!w) return '0'; const s = w.padStart(19, '0'); const i = s.slice(0, -18), f = s.slice(-18).replace(/0+$/, ''); return (i.replace(/^0+(?=\d)/, '') || '0') + (f ? '.' + f : ''); };
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+const addr = (a) => a ? `<a onclick="go('#/address/${a}')">${short(a, 8)}</a>` : '<span class="muted">—</span>';
+const txl = (h) => `<a onclick="go('#/tx/${h}')">${short(h)}</a>`;
+const blk = (n) => `<a onclick="go('#/block/${n}')">${n}</a>`;
+
+async function info(body) {
+  const r = await fetch('/info', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const j = await r.json(); if (!r.ok) throw new Error(j.error || r.statusText); return j;
+}
+function go(h) { location.hash = h; }
+function search() {
+  const q = $('#q').value.trim();
+  if (/^0x[0-9a-fA-F]{40}$/.test(q)) go('#/address/' + q.toLowerCase());
+  else if (/^0x[0-9a-fA-F]{64}$/.test(q)) go('#/tx/' + q.toLowerCase());
+  else if (/^\d+$/.test(q)) go('#/block/' + q);
+}
+
+async function home() {
+  const [status, supply, blocks, mids] = await Promise.all([
+    info({ type: 'exchangeStatus' }), info({ type: 'supply' }), info({ type: 'explorerBlocks', limit: 40 }), info({ type: 'allMids' })]);
+  const ok = supply.discrepancy === '0';
+  $('#app').innerHTML = `
+    <div class="stats">
+      <div class="stat"><div class="k">L1 height</div><div class="v">${status.height}</div></div>
+      <div class="stat"><div class="k">EVM block</div><div class="v">${status.evmBlock}</div></div>
+      <div class="stat"><div class="k">State hash</div><div class="v">${short(status.stateHash, 12)}</div></div>
+      ${Object.entries(mids).map(([c, p]) => `<div class="stat"><div class="k">${c} mid</div><div class="v">${p}</div></div>`).join('')}
+      <div class="stat"><div class="k">USDC minted</div><div class="v">${supply.totalMinted}</div></div>
+      <div class="stat"><div class="k">USDC on EVM</div><div class="v">${supply.onEvm}</div></div>
+      <div class="stat"><div class="k">Fees collected</div><div class="v">${supply.feesCollected}</div></div>
+      <div class="stat"><div class="k">Supply check</div><div class="v ${ok ? 'ok' : 'err'}">${ok ? 'conserved' : 'off by ' + supply.discrepancy}</div></div>
+    </div>
+    <section><h2>Latest blocks <span class="muted">(live)</span></h2>
+      <table><thead><tr><th>Height</th><th>Time (UTC)</th><th>Proposer</th><th>Core txs</th><th>EVM txs</th><th>EVM block</th><th>State hash</th></tr></thead>
+      <tbody id="blocks">${blocks.map(blockRow).join('')}</tbody></table></section>`;
+}
+const blockRow = (b) => `<tr><td>${blk(b.height)}</td><td>${ts(b.time)}</td><td>v${b.proposer}</td><td>${b.nTxs}</td><td>${b.nEvmTxs}</td><td>${b.evmBlock ?? '<span class="muted">—</span>'}</td><td>${short(b.stateHash, 12)}</td></tr>`;
+
+async function blockPage(h) {
+  await meta();
+  const { block, txs, endOfBlock: x, confirmations } = await info({ type: 'explorerBlock', height: +h });
+  $('#app').innerHTML = `<section><h2>Block ${block.height}</h2><table>
+    <tr><th>Time</th><td>${ts(block.time)} <span class="muted">(${ago(block.time)}, ${confirmations} confirmations)</span></td></tr><tr><th>View / proposer</th><td>${block.view} / validator ${block.proposer}</td></tr>
+    <tr><th>State hash</th><td>${block.stateHash}</td></tr><tr><th>EVM block</th><td>${block.evmBlock ?? '—'} ${block.evmBlockHash ? short(block.evmBlockHash, 12) : ''}</td></tr></table></section>
+    <section><h2>Transactions (${txs.length})</h2><table><thead><tr><th>Hash</th><th>Kind</th><th>From</th><th>Action</th><th>Status</th></tr></thead><tbody>
+    ${txs.map((t) => { const [c, l] = txStatus(t); return `<tr><td>${txl(t.hash)}</td><td><span class="pill ${t.kind}">${t.kind}</span></td><td>${addr(t.user)}</td><td>${t.kind === 'core' ? actionSummary(t.action) : t.action.contractAddress ? 'contract creation' : 'call ' + short(t.action.to ?? '', 8)}</td><td><span class="pill ${c}">${l}</span></td></tr>`; }).join('')}
+    </tbody></table></section>
+    ${x ? `<h2 style="font-size:14px;color:var(--muted);margin:0 0 6px">End-of-block execution <span class="muted" style="font-weight:400">— oracle update, TP/SL triggers, funding, risk limits and liquidations, after all transactions</span></h2>
+      ${tabbed('eobtabs', [['events', `Events (${x.nEvents})`, eventsList(x)], ['trades', `Trades (${x.nTrades})`, tradesTable(x)], ['changes', `State changes (${x.nAccounts})`, changesTable(x)]])}` : ''}`;
+}
+
+let META = null;
+async function meta() { return META ??= (await info({ type: 'meta' })).universe; }
+const coinOf = (a) => META?.[a]?.name ?? `asset ${a}`;
+const ago = (ms) => { const s = Math.max(0, (Date.now() - ms) / 1000); return s < 60 ? `${s.toFixed(0)} s ago` : s < 3600 ? `${(s / 60).toFixed(0)} min ago` : `${(s / 3600).toFixed(1)} h ago`; };
+const sideTxt = (b) => b ? '<span class="buy">Buy</span>' : '<span class="sell">Sell</span>';
+const signed = (v) => { const n = +v; return `<span class="${n > 0 ? 'ok' : n < 0 ? 'err' : 'muted'}">${n > 0 ? '+' : ''}${v}</span>`; };
+const kv = (rows) => `<div class="kv">${rows.filter(Boolean).map(([k, v]) => k === '-' ? '<div class="gap"></div>' : `<div class="k">${k}</div><div>${v}</div>`).join('')}</div>`;
+const STATUS_TEXT = { open: 'resting', filled: 'filled', canceled: 'cancelled', triggered: 'triggered', siblingFilledCanceled: 'cancelled (sibling TP/SL or entry)', iocCancelRejected: 'IOC remainder cancelled',
+  marginCanceled: 'cancelled: insufficient margin', selfTradeCanceled: 'cancelled: self-trade', reduceOnlyCanceled: 'cancelled: reduce-only', liquidatedCanceled: 'cancelled by liquidation' };
+const TIF_TEXT = { Gtc: 'Limit GTC', Ioc: 'Limit IOC', Alo: 'Post-only' };
+
+function orderKind(o) {
+  if (!o.t.trigger) return `${TIF_TEXT[o.t.limit.tif] ?? o.t.limit.tif} @ ${o.p}`;
+  // Sell TP and buy SL fire when the mark rises to the trigger; sell SL and buy TP when it falls.
+  const t = o.t.trigger, up = (t.tpsl === 'tp') !== o.b;
+  return `${t.tpsl === 'tp' ? 'Take profit' : 'Stop loss'} ${t.isMarket ? 'market' : 'limit @ ' + o.p} when mark ${up ? '≥' : '≤'} ${t.triggerPx}`;
+}
+function statusText(st) {
+  if (st == null) return '';
+  if (typeof st === 'string') return `<span class="ok">${st}</span>`;
+  if (st.error) return `<span class="err">${esc(st.error)}</span>`;
+  if (st.filled) return `<span class="ok">filled ${st.filled.totalSz} @ avg ${st.filled.avgPx}</span> <span class="muted">oid ${st.filled.oid}</span>`;
+  if (st.resting) return `<span class="warn">resting</span> <span class="muted">oid ${st.resting.oid}</span>`;
+  return esc(JSON.stringify(st));
+}
+// Overall status of a core tx: ok, failed, or partly failed (some orders/cancels errored).
+function txStatus(t) {
+  if (t.kind === 'evm') return t.result.success ? ['ok', 'Success'] : ['err', 'Reverted'];
+  if (t.result.status === 'err') return ['err', 'Failed'];
+  const st = t.result.response?.data?.statuses ?? [];
+  const bad = st.filter((x) => x?.error).length;
+  return bad === 0 ? ['ok', 'Success'] : bad === st.length ? ['err', 'Failed'] : ['warn', `Partly failed (${bad} of ${st.length})`];
+}
+function actionSummary(a) {
+  switch (a.type) {
+    case 'order': {
+      const coins = [...new Set(a.orders.map((o) => coinOf(o.a)))].join(', ');
+      return a.orders.length === 1 ? `${sideTxt(a.orders[0].b)} ${a.orders[0].s} ${coinOf(a.orders[0].a)} · ${orderKind(a.orders[0])}${a.orders[0].r ? ' · reduce-only' : ''}` : `Place ${a.orders.length} orders on ${coins}`;
+    }
+    case 'cancel': return `Cancel ${a.cancels.length} order${a.cancels.length > 1 ? 's' : ''}`;
+    case 'cancelByCloid': return `Cancel ${a.cancels.length} order${a.cancels.length > 1 ? 's' : ''} by client id`;
+    case 'updateLeverage': return `Set ${coinOf(a.asset)} leverage to ${a.leverage}x ${a.isCross ? 'cross' : 'isolated'}`;
+    case 'updateIsolatedMargin': return `${a.ntli >= 0 ? 'Add' : 'Remove'} ${(Math.abs(a.ntli) / 1e6).toLocaleString()} USDC ${a.ntli >= 0 ? 'to' : 'from'} isolated ${coinOf(a.asset)} margin`;
+    case 'twapOrder': return `TWAP ${sideTxt(a.twap.b)} ${a.twap.s} ${coinOf(a.twap.a)} over ${a.twap.m} min${a.twap.r ? ' · reduce-only' : ''}${a.twap.t ? ' · randomized' : ''}`;
+    case 'twapCancel': return `Cancel TWAP #${a.t} on ${coinOf(a.a)}`;
+    case 'evmUserModify': return `Send EVM transactions to ${a.usingBigBlocks ? 'big blocks (1/min, 30M gas)' : 'small blocks (1/s, 2M gas)'}`;
+    case 'faucet': return `Faucet ${a.usd} USDC`;
+    case 'sendToEvm': return `Bridge ${a.usd} USDC to HyperEVM`;
+    case 'setOracle': return `Oracle vote: ${a.pxs.map((p, i) => `${coinOf(i)} ${p}`).join(', ')}`;
+    case 'setRiskLimits': {
+      const parts = [a.maxPositionUsd && `max position $${a.maxPositionUsd}`, a.maxLeverage && `max ${a.maxLeverage}x`, a.dailyLossUsd && `daily loss $${a.dailyLossUsd}`, a.closeAtMarginPct && `close at ${a.closeAtMarginPct}% margin`].filter(Boolean);
+      return parts.length ? 'Risk limits: ' + parts.join(', ') : 'Remove risk limits';
+    }
+    default: return esc(a.type);
+  }
+}
+// Per-item table of what was asked and what happened to each item.
+function actionItems(t) {
+  const a = t.action, st = t.result.response?.data?.statuses ?? [];
+  const rows = (head, items) => `<table><thead><tr>${head.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>${items.slice(0, 1000).join('')}</tbody></table>${items.length > 1000 ? `<div class="note">First 1,000 of ${items.length}.</div>` : ''}`;
+  if (a.type === 'order') return rows(['#', 'Side', 'Size', 'Coin', 'Type', 'Flags', 'Result'], a.orders.map((o, i) =>
+    `<tr><td>${i}</td><td>${sideTxt(o.b)}</td><td>${o.s}</td><td>${coinOf(o.a)}</td><td>${orderKind(o)}</td><td>${[o.r && 'reduce-only', o.c && 'cloid ' + short(o.c, 6)].filter(Boolean).join(', ') || '<span class="muted">—</span>'}</td><td>${statusText(st[i])}</td></tr>`));
+  if (a.type === 'cancel') return rows(['#', 'Coin', 'Oid', 'Result'], a.cancels.map((c, i) => `<tr><td>${i}</td><td>${coinOf(c.a)}</td><td>${c.o}</td><td>${statusText(st[i])}</td></tr>`));
+  if (a.type === 'cancelByCloid') return rows(['#', 'Coin', 'Client id', 'Result'], a.cancels.map((c, i) => `<tr><td>${i}</td><td>${coinOf(c.asset)}</td><td class="mono">${short(c.cloid, 8)}</td><td>${statusText(st[i])}</td></tr>`));
+  return '';
+}
+function eventLine(e) {
+  switch (e.type) {
+    case 'order': { const o = e.update.order; return `Order ${o.oid} ${addr(e.user)} ${o.side === 'B' ? '<span class="buy">buy</span>' : '<span class="sell">sell</span>'} ${o.origSz} ${o.coin} @ ${o.limitPx} → <b>${STATUS_TEXT[e.update.status] ?? e.update.status}</b>${e.update.status === 'open' && o.sz !== o.origSz ? ` (${o.sz} left)` : ''}`; }
+    case 'fill': { const f = e.fill; return `Fill ${f.crossed ? 'taker' : 'maker'} ${addr(f.user)} ${f.dir} ${f.sz} ${f.coin} @ ${f.px} · fee ${f.fee}${+f.closedPnl ? ' · closed PnL ' + signed(f.closedPnl) : ''}${f.liquidation ? ' · <span class="err">liquidation</span>' : f.adl ? ' · <span class="warn">auto-deleveraged</span>' : ''} <span class="muted">tid ${f.tid}</span>`; }
+    case 'ledger': return `${{ faucet: 'Faucet credit', coreToEvm: 'Bridged core → EVM', evmToCore: 'Bridged EVM → core', isolatedMargin: 'Isolated margin (+ in, − out)' }[e.kind] ?? e.kind} ${e.usdc} USDC ${addr(e.user)}`;
+    case 'twap': { const t = e.twap; return `TWAP #${t.twapId} ${addr(t.user)} ${t.side === 'B' ? '<span class="buy">buy</span>' : '<span class="sell">sell</span>'} ${t.sz} ${t.coin} → <b>${t.status}</b> (${t.executedSz} filled${t.avgPx ? ` at ${t.avgPx} avg` : ''})`; }
+    case 'funding': return `Funding ${addr(e.user)} ${e.coin} ${signed(e.usdc)} USDC on ${e.szi} (rate ${e.fundingRate})`;
+    case 'liquidation': return `<span class="err">${e.method === 'adl' ? 'Auto-deleveraging' : 'Liquidation'}</span> ${addr(e.user)} (${{ market: 'market orders', backstop: 'backstop vault', adl: 'closed at the bankruptcy price against the top-ranked opposite positions' }[e.method] ?? e.method}) at account value ${e.accountValue}: ${e.positions.map((p) => `${p.szi} ${p.coin}`).join(', ')}`;
+    case 'risk': return `<span class="warn">Risk limit</span> ${addr(e.user)}: ${e.kind === 'dailyLossHalt' ? 'daily loss limit reached, new exposure halted' : 'margin limit reached, positions closed'} (account value ${e.accountValue})`;
+    case 'coreWriter': return `CoreWriter action by ${addr(e.user)}${e.coin ? ' on ' + e.coin : ''} → ${statusText(e.response)} <span class="muted">from EVM tx ${txl(e.tx)}</span>`;
+    case 'coreWriterQueued': return `CoreWriter order by ${addr(e.user)} queued: runs on core at ${ts(e.executeAt)} <span class="muted">(CoreWriter orders are delayed a few seconds, so contracts get no latency edge)</span>`;
+    case 'evmTxQueued': return `EVM tx ${txl(e.hash)} waiting for the next ${e.big ? '<b>big</b> block (once a minute, 30M gas)' : 'small block (once a second, 2M gas)'}`;
+    case 'evmTx': return `EVM tx ${txl(e.hash)} ${e.success ? '<span class="ok">success</span>' : '<span class="err">reverted</span>'} · gas ${e.gasUsed}`;
+    case 'evmTxSkipped': return `EVM tx ${short(e.hash)} skipped: ${esc(e.reason)}`;
+    case 'evmBlock': return `${e.big ? 'Big' : 'Small'} EVM block ${e.number} sealed (${e.nTxs} txs, gas ${e.gasUsed} of ${e.big ? '30M' : '2M'})`;
+    case 'prices': return `Oracle update: ${e.prices.map((p) => `${p.coin} oracle ${p.oraclePx} / mark ${p.markPx}`).join(', ')}`;
+    default: return esc(JSON.stringify(e));
+  }
+}
+function tradesTable(x) {
+  if (!x.nTrades) return '<div class="muted">No trades.</div>';
+  return `<table><thead><tr><th>Tid</th><th>Coin</th><th>Taker side</th><th>Price</th><th>Size</th><th>Notional</th><th>Taker</th><th>Taker fee</th><th>Maker</th><th>Maker fee</th></tr></thead><tbody>
+    ${x.trades.map((t) => `<tr><td>${t.tid}</td><td>${t.coin}</td><td>${t.side === 'B' ? '<span class="buy">buy</span>' : '<span class="sell">sell</span>'}</td><td>${t.px}</td><td>${t.sz}</td><td>${t.notional}</td><td>${addr(t.taker)} <span class="muted">${t.takerOid}</span></td><td>${t.takerFee}</td><td>${addr(t.maker)} <span class="muted">${t.makerOid}</span></td><td>${t.makerFee}</td></tr>`).join('')}
+    </tbody></table>${x.trades.length < x.nTrades ? `<div class="note">First ${x.trades.length} of ${x.nTrades} trades.</div>` : ''}`;
+}
+function changesTable(x) {
+  if (!x.nAccounts) return '<div class="muted">No balance or position changes.</div>';
+  return `<table><thead><tr><th>Account</th><th>Position before → after</th><th>Closed PnL</th><th>Fees</th><th>Funding</th><th>Transfers</th><th>Net USDC</th></tr></thead><tbody>
+    ${x.changes.map((c) => `<tr><td>${addr(c.user)}</td><td>${c.positions.map((p) => `${p.coin} ${p.before} → <b>${p.after}</b>`).join('<br>') || '<span class="muted">—</span>'}</td><td>${signed(c.closedPnl)}</td><td>${signed(c.fees.startsWith('-') ? c.fees.slice(1) : '-' + c.fees)}</td><td>${signed(c.funding)}</td><td>${signed(c.transfers)}</td><td>${signed(c.net)}</td></tr>`).join('')}
+    </tbody></table>${x.changes.length < x.nAccounts ? `<div class="note">First ${x.changes.length} of ${x.nAccounts} accounts.</div>` : ''}
+    <div class="note">Net USDC = closed PnL − fees + funding + transfers. Unrealized PnL of open positions is not included. Negative fees are maker rebates.</div>`;
+}
+function eventsList(x) {
+  if (!x.nEvents) return '<div class="muted">No events.</div>';
+  const counts = Object.entries(x.eventCounts).map(([k, n]) => `${n} ${k}`).join(', ');
+  return `<div class="note" style="margin:0 0 6px">${x.nEvents} events: ${counts}. In execution order.</div><ol class="steps">${x.events.map((e) => `<li>${eventLine(e)}</li>`).join('')}</ol>${x.events.length < x.nEvents ? `<div class="note">First ${x.events.length} of ${x.nEvents}.</div>` : ''}`;
+}
+// Tabbed section; tabs = [[id, label, html]].
+function tabbed(id, tabs) {
+  const first = tabs[0][0];
+  return `<section id="${id}"><div class="tabs">${tabs.map(([k, l]) => `<button data-k="${k}" class="${k === first ? 'on' : ''}" onclick="showTab('${id}','${k}')">${l}</button>`).join('')}</div>
+    ${tabs.map(([k, , html]) => `<div data-p="${k}" ${k === first ? '' : 'hidden'}>${html}</div>`).join('')}</section>`;
+}
+function showTab(id, k) {
+  document.querySelectorAll(`#${id} .tabs button`).forEach((b) => b.classList.toggle('on', b.dataset.k === k));
+  document.querySelectorAll(`#${id} [data-p]`).forEach((p) => p.hidden = p.dataset.p !== k);
+}
+const raw = (v) => `<pre>${esc(JSON.stringify(v, null, 2))}</pre>`;
+const EVM_SELECTORS = { '17938e13': 'sendRawAction(bytes) — CoreWriter', a9059cbb: 'transfer(address,uint256)', '095ea7b3': 'approve(address,uint256)', '23b872dd': 'transferFrom(address,address,uint256)', '70a08231': 'balanceOf(address)' };
+const EVM_TOPICS = { ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef: 'Transfer(address,address,uint256)', '8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925': 'Approval(address,address,uint256)', '8c7f585fb295f7eb1e6aeb8fba61b23a4fe60beda405f0045073b185c74412e3': 'RawAction(address,bytes) — CoreWriter' };
+const BRIDGE = '0x2222222222222222222222222222222222222222', CORE_WRITER = '0x3333333333333333333333333333333333333333';
+const gwei = (w) => (+w / 1e9).toLocaleString(undefined, { maximumFractionDigits: 9 });
+
+async function txPage(h) {
+  await meta();
+  const { tx, evm, execution: x, confirmations } = await info({ type: 'explorerTx', hash: h });
+  const [cls, label] = txStatus(tx);
+  const head = [['Transaction hash', `<span class="mono">${tx.hash}</span>`], ['Status', `<span class="pill ${cls}">${label}</span>${tx.result.status === 'err' ? ' <span class="err">' + esc(tx.result.response) + '</span>' : ''}`],
+    ['Block', `${blk(tx.height)} <span class="muted">${confirmations} block confirmations</span>`], ['Timestamp', `${ago(tx.time)} <span class="muted">(${ts(tx.time)} UTC)</span>`], ['-']];
+  let overview, extra = [];
+  if (tx.kind === 'core') {
+    overview = kv([...head, ['From (signer)', addr(tx.user) + ` <span class="mono muted">${tx.user}</span>`], ['Action', actionSummary(tx.action)], ['Type', `<span class="pill core">${tx.action.type}</span>`],
+      x && ['Trades', x.nTrades ? `${x.nTrades} trade${x.nTrades > 1 ? 's' : ''}, ${x.volume} USDC volume` : '<span class="muted">none</span>'],
+      x && ['Trading fees', x.nTrades ? `${x.fees} USDC <span class="muted">(taker and maker, all accounts)</span>` : '<span class="muted">0</span>'],
+      ['Gas', '<span class="muted">none: core actions pay trading fees only</span>'], ['-'],
+      ['Nonce', `<span class="mono">${tx.nonce ?? '—'}</span> <span class="muted">${tx.nonce ? '(' + ts(tx.nonce) + ')' : ''}</span>`],
+      ['Action hash', `<span class="mono" title="keccak256(msgpack(action) ‖ nonce ‖ 0x00)">${short(tx.actionHash ?? '', 18)}</span> <span class="muted">keccak256 of the msgpack action, nonce and vault byte</span>`],
+      ['Signed digest', `<span class="mono">${short(tx.eip712Digest ?? '', 18)}</span> <span class="muted">EIP-712 Agent{source: "b", connectionId: action hash}, domain Exchange / chainId 1337</span>`],
+      ['Signature', `<span class="mono">${short(tx.signature ?? '', 18)}</span> <span class="muted">signer recovered from it</span>`]]);
+    const items = actionItems(tx);
+    if (items) extra.push(['items', `Orders and results (${(tx.action.orders ?? tx.action.cancels).length})${tx.action.grouping && tx.action.grouping !== 'na' ? ` · grouping ${tx.action.grouping}` : ''}`, items]);
+  } else {
+    const a = tx.action, r = evm?.receipt;
+    const sel = a.input && a.input.length >= 10 ? a.input.slice(2, 10) : null;
+    const toTxt = a.to ? addr(a.to) + (a.to === BRIDGE ? ' <span class="pill warn">USDC bridge to core</span>' : a.to === CORE_WRITER ? ' <span class="pill core">CoreWriter</span>' : '') : `<span class="muted">contract creation</span> ${addr(a.contractAddress)}`;
+    overview = kv([...head, ['From', addr(tx.user) + ` <span class="mono muted">${tx.user}</span>`], ['To', toTxt], ['Value', `${wei(a.valueWei)} USDC`],
+      a.feeWei && ['Transaction fee', `${wei(a.feeWei)} USDC`], a.gasPriceWei && ['Gas price', `${gwei(a.gasPriceWei)} gwei`],
+      ['Gas limit & usage', a.gasLimit ? `${a.gasLimit.toLocaleString()} | ${tx.result.gasUsed.toLocaleString()} (${(100 * tx.result.gasUsed / a.gasLimit).toFixed(2)}%)` : tx.result.gasUsed.toLocaleString()],
+      ['EVM block', `${evm?.evmBlock ?? '—'} <span class="mono muted">${short(evm?.evmBlockHash ?? '', 12)}</span>`], ['-'],
+      ['Nonce / type', `${a.nonce} <span class="muted">· type ${a.type ?? '?'} ${['(legacy)', '(EIP-2930)', '(EIP-1559)'][a.type] ?? ''}</span>`],
+      a.input && ['Input data', a.input === '0x' ? '<span class="muted">none (plain transfer)</span>' : `${sel ? `<div>Method <span class="mono">0x${sel}</span> ${EVM_SELECTORS[sel] ? esc(EVM_SELECTORS[sel]) : '<span class="muted">unknown</span>'}</div>` : ''}<details><summary>${(a.input.length - 2) / 2} bytes</summary><pre>${a.input}</pre></details>`],
+      r && r.output !== '0x' && ['Output', `<pre>${r.output}</pre>`]]);
+    if (r) extra.push(['logs', `Logs (${r.logs.length})`, r.logs.length ? r.logs.map((l, i) => `<div class="kv" style="margin-bottom:10px">
+      <div class="k">${i}: address</div><div>${addr(l.address)}</div>
+      <div class="k">Event</div><div>${esc(EVM_TOPICS[l.topics[0]?.slice(2)] ?? 'unknown')}</div>
+      ${l.topics.map((t, j) => `<div class="k">topic ${j}</div><div class="mono">${t}</div>`).join('')}
+      <div class="k">data</div><div class="mono">${l.data === '0x' ? '<span class="muted">empty</span>' : l.data}</div></div>`).join('') : '<div class="muted">No logs.</div>']);
+    if (a.to === BRIDGE && tx.result.success) extra.push(['bridge', 'Core effect', `<div>${wei(a.valueWei)} USDC credited to ${addr(tx.user)} on core after the EVM block.</div>`]);
+  }
+  const tabs = [...extra];
+  if (x) {
+    tabs.push(['trades', `Trades (${x.nTrades})`, tradesTable(x)], ['changes', `State changes (${x.nAccounts})`, changesTable(x)], ['events', `Execution trace (${x.nEvents})`, eventsList(x)]);
+  }
+  tabs.push(['raw', 'Raw', `<h2>Action</h2>${raw(tx.action)}<h2 style="margin-top:12px">Result</h2>${raw(tx.result)}${evm ? `<h2 style="margin-top:12px">EVM receipt</h2>${raw(evm.receipt)}` : ''}`]);
+  $('#app').innerHTML = `<section><h2>Transaction details <span class="pill ${tx.kind}">${tx.kind}</span></h2>${overview}</section>
+    ${x ? '' : '<div class="note" style="margin:-8px 0 12px">The execution trace of this transaction was pruned (only the newest blocks keep one). Its action and result are below.</div>'}
+    ${tabbed('txtabs', tabs)}`;
+}
+
+async function addressPage(a) {
+  const d = await info({ type: 'explorerAddress', user: a });
+  const s = d.core.crossMarginSummary;
+  $('#app').innerHTML = `<div class="stats">
+      <div class="stat"><div class="k">Core account value (USDC)</div><div class="v">${s.accountValue}</div></div>
+      <div class="stat"><div class="k">Core balance (raw USDC)</div><div class="v">${s.totalRawUsd}</div></div>
+      <div class="stat"><div class="k">Withdrawable</div><div class="v">${d.core.withdrawable}</div></div>
+      <div class="stat"><div class="k">EVM balance (USDC)</div><div class="v">${wei(d.evm.balanceWei)}</div></div>
+      <div class="stat"><div class="k">EVM nonce</div><div class="v">${d.evm.nonce}${d.evm.isContract ? ' · contract' : ''}</div></div>
+    </div>
+    <section><h2>Address ${a}</h2>
+      <table><thead><tr><th>Coin</th><th>Size</th><th>Entry</th><th>Value</th><th>uPnL</th><th>Leverage</th></tr></thead><tbody>
+      ${d.core.assetPositions.map(({ position: p }) => `<tr><td>${p.coin}</td><td>${p.szi}</td><td>${p.entryPx}</td><td>${p.positionValue}</td><td class="${p.unrealizedPnl.startsWith('-') ? 'err' : 'ok'}">${p.unrealizedPnl}</td><td>${p.leverage.value}x</td></tr>`).join('') || '<tr><td colspan="6" class="muted">no positions</td></tr>'}
+      </tbody></table></section>
+    <section><h2>Open orders</h2><table><thead><tr><th>Coin</th><th>Side</th><th>Type</th><th>Price</th><th>Size</th><th>Oid</th></tr></thead><tbody>
+      ${d.openOrders.map((o) => `<tr><td>${o.coin}</td><td>${o.side === 'B' ? '<span class="buy">buy</span>' : '<span class="sell">sell</span>'}</td><td>${o.orderType ?? 'Limit'}${o.isTrigger ? ` <span class="muted">trigger ${o.triggerPx}${o.waitingForEntry ? ', waiting for entry' : ''}</span>` : ''}</td><td>${o.isTrigger && o.isMarket ? 'market' : o.limitPx}</td><td>${o.sz}</td><td>${o.oid}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">none</td></tr>'}
+    </tbody></table></section>
+    <section><h2>On-chain activity (latest first)</h2><table><thead><tr><th>Block</th><th>Time</th><th>Kind</th><th>Detail</th></tr></thead><tbody>
+      ${d.activity.map((x) => `<tr><td>${blk(x.height)}</td><td>${ts(x.time)}</td><td>${x.kind}</td><td>${activityText(x)}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">none</td></tr>'}
+    </tbody></table></section>`;
+}
+function activityText(x) {
+  const d = x.detail;
+  switch (x.kind) {
+    case 'fill': return `${d.dir} ${d.sz} ${d.coin} @ ${d.px} · fee ${d.fee} · closedPnl ${d.closedPnl}${d.liquidation ? ' · LIQUIDATION' : d.adl ? ' · AUTO-DELEVERAGED' : ''}`;
+    case 'ledger': return `${d.kind} ${d.usdc} USDC`;
+    case 'funding': return `funding ${d.coin} ${d.usdc} USDC (rate ${d.fundingRate})`;
+    case 'evmTx': return `${txl(d.tx)} → ${addr(d.to ?? d.contractAddress)} value ${wei(d.valueWei)} ${d.success ? '<span class="ok">ok</span>' : '<span class="err">reverted</span>'}`;
+    case 'evmTransferIn': return `received ${wei(d.valueWei)} USDC from ${addr(d.from)} in ${txl(d.tx)}`;
+    case 'action': return `${txl(d.tx)} ${esc(d.action.type)}`;
+    case 'risk': return `${d.kind === 'dailyLossHalt' ? 'daily loss limit reached: new exposure halted' : 'margin limit reached: positions closed'} (account value ${d.accountValue})`;
+    case 'liquidation': return `<span class="err">${d.method === 'adl' ? 'auto-deleveraged' : 'liquidated'}</span> (${d.method}) at account value ${d.accountValue}`;
+    case 'coreWriter': return `CoreWriter action → ${statusText(d)}${d.tx ? ` <span class="muted">from ${txl(d.tx)}</span>` : ''}`;
+    case 'twap': return `TWAP #${d.twapId} ${d.side === 'B' ? 'buy' : 'sell'} ${d.sz} ${d.coin} ${d.status} · ${d.executedSz} filled${d.avgPx ? ` at ${d.avgPx} avg` : ''}`;
+    default: return esc(JSON.stringify(d));
+  }
+}
+
+async function route() {
+  const [, kind, arg] = location.hash.split('/');
+  try {
+    if (kind === 'block') await blockPage(arg);
+    else if (kind === 'tx') await txPage(arg);
+    else if (kind === 'address') await addressPage(arg);
+    else await home();
+  } catch (e) { $('#app').innerHTML = `<section class="err">${esc(e.message)}</section>`; }
+}
+window.addEventListener('hashchange', route);
+route();
+
+// Live blocks on the home page.
+function live() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => ws.send(JSON.stringify({ method: 'subscribe', subscription: { type: 'blocks' } }));
+  ws.onmessage = (m) => {
+    const msg = JSON.parse(m.data);
+    if (msg.channel !== 'blocks' || !$('#blocks')) return;
+    clearTimeout(window._refresh); window._refresh = setTimeout(() => { if (!location.hash || location.hash === '#/') home(); }, 400);
+  };
+  ws.onclose = () => setTimeout(live, 1000);
+}
+live();
+</script>
+</body>
+</html>
