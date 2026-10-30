@@ -320,8 +320,6 @@ impl LogSink {
     }
 
     fn snapshot(&self, height: u64, state_hash: Hash32, state: &[u8]) -> std::io::Result<()> {
-        let path = snapshot_path(&self.path);
-        let tmp = path.with_extension("snapshot.tmp");
         let meta = SnapshotMeta {
             genesis_time_ms: self.header["genesis_time_ms"].as_u64().unwrap_or_default(),
             height,
@@ -329,28 +327,57 @@ impl LogSink {
             segment_start: self.segment_start,
             log_offset: self.offset,
         };
-        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        writeln!(f, "{}", serde_json::to_string(&meta).expect("meta encodes"))?;
-        f.write_all(state)?;
-        f.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-        std::fs::rename(&tmp, &path)?;
-        tracing::info!(height, mb = format!("{:.1}", state.len() as f64 / 1e6), "state snapshot written");
-        Ok(())
+        write_snapshot(&self.path, &meta, state)
     }
 
     /// Replaces the log with a new segment holding the blocks after `height`.
     fn new_segment(&mut self, height: u64) -> std::io::Result<std::fs::File> {
-        let tmp = self.path.with_extension("jsonl.tmp");
-        let mut header = self.header.clone();
-        header["snapshot_height"] = height.into();
-        let line = format!("{header}\n");
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(line.as_bytes())?;
-        std::fs::rename(&tmp, &self.path)?;
+        let (f, len) = start_segment(&self.path, &self.header, height)?;
         self.segment_start = height;
-        self.offset = line.len() as u64;
+        self.offset = len;
         Ok(f)
     }
+}
+
+/// Writes the snapshot next to the log at `log` (atomically: temp file, then rename).
+pub fn write_snapshot(log: &std::path::Path, meta: &SnapshotMeta, state: &[u8]) -> std::io::Result<()> {
+    let path = snapshot_path(log);
+    let tmp = path.with_extension("snapshot.tmp");
+    let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+    writeln!(f, "{}", serde_json::to_string(meta).expect("meta encodes"))?;
+    f.write_all(state)?;
+    f.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    tracing::info!(height = meta.height, mb = format!("{:.1}", state.len() as f64 / 1e6), "state snapshot written");
+    Ok(())
+}
+
+/// Replaces the log at `log` with a new segment for the blocks after
+/// `height` (header = genesis header + `snapshot_height`). Returns the file,
+/// open for appending, and its length.
+pub fn start_segment(log: &std::path::Path, genesis_header: &serde_json::Value, height: u64) -> std::io::Result<(std::fs::File, u64)> {
+    let tmp = log.with_extension("jsonl.tmp");
+    let mut header = genesis_header.clone();
+    if let Some(h) = header.as_object_mut() {
+        h.remove("snapshot_height");
+    }
+    header["snapshot_height"] = height.into();
+    let line = format!("{header}\n");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(line.as_bytes())?;
+    std::fs::rename(&tmp, log)?;
+    Ok((f, line.len() as u64))
+}
+
+/// A snapshot file's contents: its header and the postcard-encoded state.
+pub fn parse_snapshot(bytes: &[u8]) -> Result<(SnapshotMeta, State), String> {
+    let nl = bytes.iter().position(|b| *b == b'\n').ok_or("snapshot has no header line")?;
+    let meta: SnapshotMeta = serde_json::from_slice(&bytes[..nl]).map_err(|e| format!("bad snapshot header: {e}"))?;
+    let state: State = postcard::from_bytes(&bytes[nl + 1..]).map_err(|e| format!("bad snapshot state: {e}"))?;
+    if state.height != meta.height || state.hash() != meta.state_hash {
+        return Err(format!("snapshot at height {} does not match its recorded state hash", meta.height));
+    }
+    Ok((meta, state))
 }
 
 /// Consumes finalized blocks until the channel closes.

@@ -281,7 +281,23 @@ async fn sync_from_peers(shared: &Shared, chain: &mut hc_node::node::Loaded, arg
         let got = info(api, serde_json::json!({"type": "blockLog", "from": from})).await;
         let entries: Vec<hc_node::node::LogEntry> = got.and_then(|v| serde_json::from_value(v["entries"].clone()).ok()).unwrap_or_default();
         if entries.first().map(|e| e.height) != Some(from) {
-            anyhow::bail!("node {i} cannot serve blocks from height {from} (its log starts after its last snapshot); restart this node's chain");
+            // The peer's log starts after its last snapshot: take the snapshot, then its blocks.
+            let (meta, state) = snapshot_from_peer(&client, i, api, &heights, f, chain.genesis.time_ms).await?;
+            anyhow::ensure!(meta.height > chain.state.height, "node {i}'s snapshot at {} is not ahead of this node", meta.height);
+            let own = hc_node::node::SnapshotMeta { segment_start: meta.height, log_offset: 0, ..meta.clone() };
+            let (new_file, len) = hc_node::node::start_segment(&args.log, &chain.header, meta.height)?;
+            hc_node::node::write_snapshot(&args.log, &hc_node::node::SnapshotMeta { log_offset: len, ..own }, &postcard::to_stdvec(&state)?)?;
+            file = new_file;
+            chain.state = state;
+            chain.valid_len = len;
+            chain.segment_start = meta.height;
+            chain.last_certificate = None;
+            // The explorer starts over from the snapshot.
+            let mut fresh = hc_node::history::History::default();
+            fresh.candle_file = shared.history.read().expect("history lock").candle_file.clone();
+            *shared.history.write().expect("history lock") = fresh;
+            tracing::info!(height = meta.height, from = i, "loaded peer's state snapshot");
+            continue;
         }
         for e in entries {
             let fin = e.finalized().map_err(|err| anyhow::anyhow!("bad block from node {i}: {err}"))?;
@@ -307,6 +323,35 @@ async fn sync_from_peers(shared: &Shared, chain: &mut hc_node::node::Loaded, arg
     anyhow::ensure!(agree >= f, "only {agree} peers report this node's state hash at height {}; need {f}", chain.state.height);
     tracing::info!(height = chain.state.height, peers_agreeing = agree, "in sync with peers");
     Ok(())
+}
+
+/// Downloads peer `i`'s state snapshot and checks it: it must hash to its
+/// recorded state hash, belong to this genesis, and at least f + 1
+/// validators (the peer included) must report that hash at its height.
+async fn snapshot_from_peer(
+    client: &reqwest::Client,
+    i: usize,
+    api: SocketAddr,
+    peers: &[(usize, SocketAddr, u64)],
+    f: usize,
+    genesis_time_ms: u64,
+) -> anyhow::Result<(hc_node::node::SnapshotMeta, hc_core::State)> {
+    let bytes = client.get(format!("http://{api}/snapshot")).timeout(Duration::from_secs(60)).send().await?.error_for_status()?.bytes().await?;
+    let (meta, state) = hc_node::node::parse_snapshot(&bytes).map_err(|e| anyhow::anyhow!("node {i}: {e}"))?;
+    anyhow::ensure!(meta.genesis_time_ms == genesis_time_ms, "node {i}'s snapshot belongs to another chain");
+    let mut agree = 0;
+    for &(_, peer, _) in peers {
+        let body = serde_json::json!({"type": "stateHash", "height": meta.height});
+        let r = client.post(format!("http://{peer}/info")).json(&body).timeout(Duration::from_secs(5)).send().await;
+        let theirs = match r {
+            Ok(r) => r.json::<serde_json::Value>().await.ok().and_then(|v| serde_json::from_value::<hc_core::types::Hash32>(v["stateHash"].clone()).ok()),
+            Err(_) => None,
+        };
+        agree += usize::from(theirs == Some(meta.state_hash));
+    }
+    anyhow::ensure!(agree > f, "only {agree} validators report node {i}'s snapshot hash at height {}; need {}", meta.height, f + 1);
+    tracing::info!(height = meta.height, validators_agreeing = agree, mb = format!("{:.1}", bytes.len() as f64 / 1e6), "verified peer snapshot");
+    Ok((meta, state))
 }
 
 async fn wait_term() {

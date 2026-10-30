@@ -21,6 +21,7 @@ DIR=run/multi
 API_BASE=${API_BASE:-8180}
 P2P_BASE=${P2P_BASE:-9100}
 SIM=${SIM:-200}
+SNAPSHOT=${SNAPSHOT:-2000}   # blocks between state snapshots (each node keeps only the log since its last one)
 
 n_nodes() { cat "$DIR/n" 2>/dev/null || echo 4; }
 addrs() { local n=$1 base=$2 out=""; for ((i = 0; i < n; i++)); do out+="${out:+,}127.0.0.1:$((base + i))"; done; echo "$out"; }
@@ -30,7 +31,7 @@ launch() { # index, extra args
   local n; n=$(n_nodes)
   local sim=0; [[ $i == 0 ]] && sim=$SIM
   nohup "$BIN" run --index "$i" --genesis "$DIR/genesis.json" --peers "$(addrs "$n" $P2P_BASE)" --peer-apis "$(addrs "$n" $API_BASE)" \
-    --api "127.0.0.1:$((API_BASE + i))" --log "$DIR/blocks-$i.jsonl" --sim-trades-per-block "$sim" "$@" \
+    --api "127.0.0.1:$((API_BASE + i))" --log "$DIR/blocks-$i.jsonl" --sim-trades-per-block "$sim" --snapshot-blocks "$SNAPSHOT" "$@" \
     >"$DIR/node-$i.log" 2>&1 &
   echo $! >"$DIR/node-$i.pid"
   echo "node $i: pid $!, API http://127.0.0.1:$((API_BASE + i)), log $DIR/node-$i.log"

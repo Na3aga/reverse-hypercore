@@ -168,9 +168,13 @@ log for this. Tested: after a revived node rejoins, killing a different node
 still leaves 3 voting validators, so the revived one is voting.
 
 The nodes could run on separate machines with the same flags (`--peers`,
-`--peer-apis`); this has only been tested on one machine. A node can only catch
-up on blocks its peers still have in their logs, which go back to their last
-snapshot (2,000 blocks, a few minutes); fetching a peer's snapshot is not done.
+`--peer-apis`); this has only been tested on one machine.
+
+**State sync:** peers keep only the blocks since their last snapshot. A node
+that was down longer downloads a peer's snapshot (`GET /snapshot`), checks it
+hashes to its recorded state hash and that f + 1 validators report that hash
+at its height, then replays the blocks after it. Tested with
+`SNAPSHOT=100 scripts/multi-process.sh start` (snapshots every 100 blocks).
 
 ## Performance
 
@@ -267,5 +271,4 @@ Replay and determinism coverage:
 ## Not included (MVP scope)
 - trailing stops, vaults, spot markets, HIP-3 markets, vault signing (`vaultAddress`), `expiresAfter`, and user-signed transfers (`usdSend`, `withdraw3`)
 - staking and validator set changes; the set is fixed at genesis
-- catching up from a peer's state snapshot (a node down for more than a snapshot interval cannot rejoin)
 - deployment across machines (supported by the flags, but only tested on one machine)

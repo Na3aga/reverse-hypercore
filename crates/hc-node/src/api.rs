@@ -33,7 +33,18 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/", get(trade_page))
         .route("/explorer", get(explorer_page))
         .route("/ui/hcsign.js", get(signer_js))
+        .route("/snapshot", get(snapshot_file))
         .with_state(shared)
+}
+
+/// This node's latest state snapshot (header line + postcard state), for a
+/// peer that is too far behind to catch up from blocks alone.
+async fn snapshot_file(AxState(shared): AxState<Arc<Shared>>) -> impl IntoResponse {
+    let Some(log) = shared.log_path.get() else { return (axum::http::StatusCode::NOT_FOUND, "no block log").into_response() };
+    match tokio::fs::read(crate::node::snapshot_path(log)).await {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
+        Err(_) => (axum::http::StatusCode::NOT_FOUND, "no snapshot yet").into_response(),
+    }
 }
 
 async fn http_info(AxState(shared): AxState<Arc<Shared>>, Json(req): Json<Value>) -> impl IntoResponse {
