@@ -82,6 +82,7 @@ function canonical(action) {
     case 'twapOrder': return { type: 'twapOrder', twap: pick(action.twap, ['a', 'b', 's', 'r', 'm', 't']) };
     case 'twapCancel': return pick(action, ['type', 'a', 't']);
     case 'evmUserModify': return pick(action, ['type', 'usingBigBlocks']);
+    case 'approveAgent': return { ...pick(action, ['type', 'signatureChainId', 'hyperliquidChain', 'agentAddress']), agentName: action.agentName ?? '', nonce: action.nonce };
     case 'faucet': case 'sendToEvm': return pick(action, ['type', 'usd']);
     case 'setOracle': return pick(action, ['type', 'pxs']);
     case 'setRiskLimits': return pick(action, ['type', 'maxPositionUsd', 'maxLeverage', 'dailyLossUsd', 'closeAtMarginPct']);
@@ -89,10 +90,29 @@ function canonical(action) {
   }
 }
 
+// ---- User-signed actions (approveAgent) ------------------------------------------------
+export const APPROVE_AGENT_TYPES = {
+  'HyperliquidTransaction:ApproveAgent': [
+    { name: 'hyperliquidChain', type: 'string' }, { name: 'agentAddress', type: 'address' },
+    { name: 'agentName', type: 'string' }, { name: 'nonce', type: 'uint64' },
+  ],
+};
+
+/** EIP-712 typed data of an approveAgent action, as a wallet signs it. */
+export function approveAgentTypedData(action) {
+  return {
+    domain: { name: 'HyperliquidSignTransaction', version: '1', chainId: parseInt(action.signatureChainId), verifyingContract: '0x0000000000000000000000000000000000000000' },
+    types: APPROVE_AGENT_TYPES,
+    primaryType: 'HyperliquidTransaction:ApproveAgent',
+    message: { hyperliquidChain: action.hyperliquidChain, agentAddress: action.agentAddress, agentName: action.agentName ?? '', nonce: BigInt(action.nonce) },
+  };
+}
+
 /** Signs a core action; returns the JSON body for /exchange or a WS post. */
 export async function signAction(privateKey, action, nonce = Date.now()) {
   action = canonical(action);
-  const sig = await sign({ hash: signingHash(action, nonce), privateKey, to: 'object' });
+  const hash = action.type === 'approveAgent' ? hashTypedData(approveAgentTypedData(action)) : signingHash(action, nonce);
+  const sig = await sign({ hash, privateKey, to: 'object' });
   const v = Number(sig.v ?? 27n + BigInt(sig.yParity));
   const signature = concat([hexToBytes(sig.r, { size: 32 }), hexToBytes(sig.s, { size: 32 }), Uint8Array.of(v)]);
   return { action, nonce, signature: toHex(signature) };

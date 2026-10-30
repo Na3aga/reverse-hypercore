@@ -11,8 +11,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const work = process.argv[2];
 copyFileSync(join(root, 'crates/hc-node/src/ui/hcsign.js'), join(work, 'hcsign.mjs'));
-const { signAction, devKey, addressOf, signingHash } = await import(pathToFileURL(join(work, 'hcsign.mjs')));
-const { signL1Action } = await import(pathToFileURL(join(work, 'node_modules/@nktkas/hyperliquid/esm/signing/mod.js')));
+const { signAction, devKey, addressOf, signingHash, approveAgentTypedData, APPROVE_AGENT_TYPES } = await import(pathToFileURL(join(work, 'hcsign.mjs')));
+const { hashTypedData } = await import(pathToFileURL(join(work, 'node_modules/viem/_esm/index.js')));
+const { signL1Action, signUserSignedAction } = await import(pathToFileURL(join(work, 'node_modules/@nktkas/hyperliquid/esm/signing/mod.js')));
 const { privateKeyToAccount } = await import(pathToFileURL(join(work, 'node_modules/viem/_esm/accounts/index.js')));
 const { recoverAddress } = await import(pathToFileURL(join(work, 'node_modules/viem/_esm/index.js')));
 
@@ -26,9 +27,14 @@ const dropNulls = (v) => Array.isArray(v) ? v.map(dropNulls)
 let fails = 0;
 for (const v of vectors) {
   const ours = await signAction(pk, v.action, v.nonce);
-  const sdk = await signL1Action({ wallet, action: dropNulls(v.action), nonce: v.nonce, isTestnet: true });
+  // approveAgent is user-signed (its own EIP-712 message); everything else is an L1 action.
+  const userSigned = v.action.type === 'approveAgent';
+  const sdk = userSigned
+    ? await signUserSignedAction({ wallet, action: v.action, types: APPROVE_AGENT_TYPES })
+    : await signL1Action({ wallet, action: dropNulls(v.action), nonce: v.nonce, isTestnet: true });
   const sdkSig = `${sdk.r.slice(2).padStart(64, '0')}${sdk.s.slice(2).padStart(64, '0')}${sdk.v.toString(16)}`;
-  const signer = (await recoverAddress({ hash: signingHash(v.action, v.nonce), signature: v.signature })).toLowerCase();
+  const digest = userSigned ? hashTypedData(approveAgentTypedData(v.action)) : signingHash(v.action, v.nonce);
+  const signer = (await recoverAddress({ hash: digest, signature: v.signature })).toLowerCase();
   const checks = {
     'hcsign.js == Rust': ours.signature === v.signature && JSON.stringify(ours.action) === JSON.stringify(v.action),
     'Hyperliquid SDK == Rust': `0x${sdkSig}` === v.signature,

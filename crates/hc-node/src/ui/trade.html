@@ -216,6 +216,7 @@
       <div class="wallet">
         <select id="wallet" aria-label="Wallet">
           <option value="alice">alice</option><option value="bob">bob</option><option value="carol">carol</option><option value="dave">dave</option>
+          <option value="metamask">MetaMask…</option>
           <option value="custom">Private key…</option>
         </select>
         <span class="addr" id="addr"></span>
@@ -277,9 +278,9 @@
 <div id="toasts" aria-live="polite"></div>
 
 <script type="module">
-import { signAction, devKey, addressOf } from '/ui/hcsign.js';
-import { createWalletClient, http, parseEther, formatEther, defineChain } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
+import { signAction, devKey, addressOf, approveAgentTypedData } from '/ui/hcsign.js';
+import { createWalletClient, http, custom, parseEther, formatEther, defineChain } from 'viem';
+import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 
 const $ = (s) => document.querySelector(s);
 const chain = defineChain({ id: 31337, name: 'HC devnet', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: [location.origin + '/evm'] } } });
@@ -855,7 +856,7 @@ const cancel = (coin, oid) => act({ type: 'cancel', cancels: [{ a: S.meta.univer
 async function toCore() {
   const amt = $('#amt').value.trim();
   try {
-    const wallet = createWalletClient({ account: privateKeyToAccount(S.key), chain, transport: http() });
+    const wallet = await evmWallet();
     const t0 = performance.now();
     const hash = await wallet.sendTransaction({ to: BRIDGE, value: parseEther(amt), gasPrice: 0n, type: 'legacy' });
     toast(`Moving ${amt} USDC to core`, '', `EVM tx ${hash.slice(0, 10)}… submitted in ${Math.round(performance.now() - t0)} ms`);
@@ -877,11 +878,69 @@ function setSide(s) {
   document.querySelectorAll('.seg.side button').forEach((b) => b.setAttribute('aria-pressed', b.dataset.v === s));
   $('#submit').className = `submit ${s}`; $('#submit').textContent = S.kind === 'twap' ? `Start ${s} TWAP` : `Place ${s} order`;
 }
-function setWallet(name) {
-  let key = name === 'custom' ? prompt('Private key (0x…)') : devKey(name);
-  if (!key) { $('#wallet').value = 'alice'; key = devKey('alice'); }
-  S.key = key; S.addr = addressOf(key);
-  $('#addr').textContent = `${S.addr.slice(0, 6)}…${S.addr.slice(-4)}`; $('#addr').title = S.addr;
+// ---- Wallets ------------------------------------------------------------------------
+// Dev wallets and pasted keys sign everything in the page. A browser wallet
+// (MetaMask) works as on Hyperliquid: it signs one user-signed approveAgent
+// message for a key generated here, and that agent key signs orders, so
+// trading needs no popup. The agent acts for the account; it cannot move
+// funds to any other address.
+const AGENT_NAME = 'hc-web';
+async function connectBrowserWallet() {
+  const eth = window.ethereum;
+  if (!eth) throw new Error('no browser wallet found; install MetaMask or pick a dev wallet');
+  const [owner] = (await eth.request({ method: 'eth_requestAccounts' })).map((a) => a.toLowerCase());
+  const keyName = `hc-agent:${owner}`;
+  let agentKey = localStorage.getItem(keyName);
+  const acct = await info({ type: 'explorerAddress', user: owner });
+  if (agentKey && acct.agents.some((a) => a.address === addressOf(agentKey))) return { owner, agentKey };
+  agentKey = generatePrivateKey();
+  const nonce = Date.now();
+  const action = { type: 'approveAgent', signatureChainId: await eth.request({ method: 'eth_chainId' }), hyperliquidChain: 'Testnet', agentAddress: addressOf(agentKey), agentName: AGENT_NAME, nonce };
+  const td = approveAgentTypedData(action);
+  const typed = {
+    ...td,
+    types: { EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }], ...td.types },
+    message: { ...td.message, nonce },
+  };
+  toast('Approve trading in your wallet', '', 'One signature lets this browser trade for your account. It cannot send your funds anywhere else.');
+  let sig = await eth.request({ method: 'eth_signTypedData_v4', params: [owner, JSON.stringify(typed)] });
+  // Some wallets return v as 0/1.
+  const v = parseInt(sig.slice(-2), 16);
+  if (v < 27) sig = sig.slice(0, -2) + (v + 27).toString(16);
+  const res = await post({ action, nonce, signature: sig });
+  if (res.status !== 'ok') throw new Error(res.response);
+  localStorage.setItem(keyName, agentKey);
+  toast('Trading enabled', 'ok', `agent ${addressOf(agentKey).slice(0, 10)}… approved for ${owner.slice(0, 10)}…`);
+  return { owner, agentKey };
+}
+// EVM transactions: from the browser wallet itself, or from the page's key.
+async function evmWallet() {
+  if (!S.agent) return createWalletClient({ account: privateKeyToAccount(S.key), chain, transport: http() });
+  const eth = window.ethereum;
+  const hex = `0x${chain.id.toString(16)}`;
+  try { await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: hex }] }); }
+  catch { await eth.request({ method: 'wallet_addEthereumChain', params: [{ chainId: hex, chainName: chain.name, nativeCurrency: chain.nativeCurrency, rpcUrls: chain.rpcUrls.default.http }] }); }
+  return createWalletClient({ account: S.addr, chain, transport: custom(eth) });
+}
+async function setWallet(name) {
+  let key, addr, agent = null;
+  if (name === 'metamask') {
+    try {
+      const w = await connectBrowserWallet();
+      key = w.agentKey; addr = w.owner; agent = addressOf(key);
+    } catch (e) {
+      toast(`Browser wallet: ${e.shortMessage ?? e.message}`, 'err');
+      $('#wallet').value = 'alice';
+      return setWallet('alice');
+    }
+  } else {
+    key = name === 'custom' ? prompt('Private key (0x…)') : devKey(name);
+    if (!key) { $('#wallet').value = 'alice'; key = devKey('alice'); }
+    addr = addressOf(key);
+  }
+  S.key = key; S.addr = addr; S.agent = agent;
+  $('#addr').textContent = `${S.addr.slice(0, 6)}…${S.addr.slice(-4)}${agent ? ' · agent' : ''}`;
+  $('#addr').title = agent ? `${S.addr} (orders signed by agent ${agent})` : S.addr;
   $('#explorerlink').href = `/explorer#/address/${S.addr}`;
   try { localStorage.setItem('hc-wallet', name === 'custom' ? 'alice' : name); } catch {}
   resubscribe(); refreshAccount();

@@ -150,7 +150,19 @@ pub struct State {
     pub big_block_users: std::collections::BTreeSet<Address>,
     /// CoreWriter orders waiting out their delay, in the order they were sent.
     pub core_writer_queue: std::collections::VecDeque<evm_bridge::DelayedCoreWriter>,
+    /// Approved agent (API wallet) -> the account it signs for.
+    pub agents: BTreeMap<Address, Agent>,
 }
+
+/// An agent key approved by an account (`approveAgent`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Agent {
+    pub owner: Address,
+    pub name: String,
+}
+
+/// Most agents one account may have approved.
+pub const MAX_AGENTS: usize = 4;
 
 pub fn fee_collector() -> Address {
     Address::system("fee-collector")
@@ -233,6 +245,7 @@ impl State {
             last_big_evm_slot: g.time_ms / 60_000,
             big_block_users: Default::default(),
             core_writer_queue: Default::default(),
+            agents: BTreeMap::new(),
         }
     }
 
@@ -291,7 +304,7 @@ impl State {
         for (tx, signer) in order {
             let start = out.events.len() as u32;
             let (user, resp) = match signer {
-                Some(user) => (user, self.deliver(user, tx, &mut out.events, &mut oracle_voted)),
+                Some(signer) => self.deliver(signer, tx, &mut out.events, &mut oracle_voted),
                 None => (Address::default(), TxResponse::err("Invalid signature.")),
             };
             let hash = tx.hash();
@@ -460,11 +473,24 @@ impl State {
         }
     }
 
-    fn deliver(&mut self, user: Address, tx: &SignedTx, events: &mut Vec<Event>, oracle_voted: &mut bool) -> TxResponse {
-        if let Err(e) = self.check_nonce(user, tx.nonce) {
-            return TxResponse::err(e);
+    /// Applies one transaction. Nonces are tracked per signer; an approved
+    /// agent's actions apply to its owner's account. Returns the account the
+    /// transaction acted for, and its response.
+    fn deliver(&mut self, signer: Address, tx: &SignedTx, events: &mut Vec<Event>, oracle_voted: &mut bool) -> (Address, TxResponse) {
+        if let Err(e) = self.check_nonce(signer, tx.nonce) {
+            return (signer, TxResponse::err(e));
         }
-        match &tx.action {
+        let user = self.agents.get(&signer).map_or(signer, |a| a.owner);
+        let resp = match &tx.action {
+            Action::ApproveAgent { .. } if user != signer => TxResponse::err("Agents cannot approve agents."),
+            Action::SetOracle { .. } if user != signer => TxResponse::err("Agents cannot vote for validators."),
+            action => self.apply_action(user, tx.nonce, action, events, oracle_voted),
+        };
+        (user, resp)
+    }
+
+    fn apply_action(&mut self, user: Address, nonce: u64, action: &Action, events: &mut Vec<Event>, oracle_voted: &mut bool) -> TxResponse {
+        match action {
             Action::Order { orders, grouping } => TxResponse::Order { statuses: self.order_action(user, orders, *grouping, events) },
             Action::Cancel { cancels } => {
                 let statuses = cancels.iter().map(|c| self.cancel(user, c, events)).collect();
@@ -478,6 +504,9 @@ impl State {
             Action::UpdateIsolatedMargin { asset, is_buy: _, ntli } => self.update_isolated_margin(user, *asset, *ntli, events),
             Action::TwapOrder { twap } => self.twap_order(user, twap, events),
             Action::TwapCancel { a, t } => self.twap_cancel(user, *a, *t, events),
+            Action::ApproveAgent { hyperliquid_chain, agent_address, agent_name, nonce: action_nonce, .. } => {
+                self.approve_agent(user, nonce, hyperliquid_chain, *agent_address, agent_name, *action_nonce)
+            }
             Action::EvmUserModify { using_big_blocks } => {
                 if *using_big_blocks {
                     self.big_block_users.insert(user);
@@ -499,6 +528,30 @@ impl State {
                 r
             }
         }
+    }
+
+    fn approve_agent(&mut self, user: Address, tx_nonce: u64, chain: &str, agent: Address, name: &str, action_nonce: u64) -> TxResponse {
+        if chain != crate::action::HYPERLIQUID_CHAIN {
+            return TxResponse::err(format!("Wrong hyperliquidChain {chain:?}; this network is {:?}.", crate::action::HYPERLIQUID_CHAIN));
+        }
+        if action_nonce != tx_nonce {
+            return TxResponse::err("Action nonce does not match the transaction nonce.");
+        }
+        if name.len() > 16 {
+            return TxResponse::err("Agent name is longer than 16 characters.");
+        }
+        // An address that holds funds, positions or orders is an account of its own.
+        let in_use = self.users.get(&agent).is_some_and(|u| u.balance != Usd::ZERO || !u.positions.is_empty() || !u.open_orders.is_empty());
+        if agent == user || self.agents.get(&agent).is_some_and(|a| a.owner != user) || in_use {
+            return TxResponse::err("Agent address is already an account or another account's agent.");
+        }
+        // The same name replaces the earlier agent.
+        self.agents.retain(|_, a| !(a.owner == user && a.name == name));
+        if self.agents.values().filter(|a| a.owner == user).count() >= MAX_AGENTS {
+            return TxResponse::err(format!("At most {MAX_AGENTS} agents per account."));
+        }
+        self.agents.insert(agent, Agent { owner: user, name: name.to_string() });
+        TxResponse::Default
     }
 
     /// Bridge into the EVM: debit withdrawable core balance, credit native EVM balance.

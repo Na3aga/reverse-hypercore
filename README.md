@@ -25,6 +25,7 @@ A local, deterministic version of the Hyperliquid flow:
   - a **bridge**: the `sendToEvm` action moves USDC from core to EVM, and sending value to `0x2222…2222` moves it back.
 - **One key, one address:** secp256k1 keys sign both core actions and EVM transactions, so a trader's core account and EVM account share an address.
 - **Hyperliquid's signing:** a core action is signed as EIP-712 typed data `Agent{source, connectionId}`, where `connectionId = keccak256(msgpack(action) ‖ nonce ‖ vault byte)`. A Hyperliquid client library produces valid signatures for this node: `scripts/check-js-signer.mjs` checks the Rust signer, the browser signer and the independent `@nktkas/hyperliquid` SDK against each other.
+- **Agent (API) wallets:** an account approves a key with the user-signed `approveAgent` (EIP-712 in the `HyperliquidSignTransaction` domain, on whatever chain the wallet is on), and that key's actions then act for the account. The trading UI's **MetaMask…** wallet works this way, as on Hyperliquid: one wallet signature, then orders without popups.
 - **Interfaces:**
   - a trading terminal at `/` and a block explorer at `/explorer`. The terminal has:
     - a candlestick chart with your fills as B/S markers, plus your entry price and resting orders as price lines;
@@ -232,9 +233,10 @@ The learning guide in `../docs/learn/` explains how the whole system works, with
 ## Tests
 
 ```sh
-cargo test --workspace --release       # 71 tests: engine, margin modes and ADL, TWAP, EVM blocks, scenarios, replay,
+cargo test --workspace --release       # 73 tests: engine, margin modes and ADL, TWAP, EVM blocks, agents, scenarios, replay,
                                        # restart from snapshots, signing vectors, consensus, EVM, market simulator
-node scripts/check-js-signer.mjs <dir with viem, @noble/hashes@1.6, @nktkas/hyperliquid>  # Rust == browser == Hyperliquid SDK signatures
+node scripts/check-js-signer.mjs <dir with viem@2.21, @noble/hashes@1.6, @nktkas/hyperliquid>  # Rust == browser == Hyperliquid SDK signatures
+# (viem 2.57+ rejects the struct name "HyperliquidTransaction:ApproveAgent"; the UI loads 2.21 too)
 # Headless browser checks against a running devnet (<dir> has playwright-core):
 node scripts/ui-smoke.mjs <dir> [outdir]          # trading flow, bridge, explorer supply check
 node scripts/ui-tpsl.mjs <dir> [outdir]           # TP/SL fires, sibling cancels, risk limit rejects
@@ -242,6 +244,7 @@ node scripts/ui-tpsl-partial.mjs <dir> [outdir]   # partial TP/SL levels next to
 node scripts/ui-tpsl-typing.mjs <dir>             # typing survives live account updates
 node scripts/ui-margin-twap.mjs <dir> [outdir]    # isolated margin add/remove, TWAP slices and cancel, big-blocks switch
 node scripts/ui-explorer.mjs <dir> [outdir]       # transaction page tabs, end-of-block execution
+node scripts/ui-browser-wallet.mjs <dir> [outdir] # MetaMask stand-in approves an agent once, then trades without prompts
 ```
 
 Replay and determinism coverage:
@@ -254,7 +257,7 @@ Replay and determinism coverage:
 - 400 blocks of simulated trading conserve USDC exactly through fees and funding, and two runs end at the same state hash.
 
 ## Not included (MVP scope)
-- trailing stops, vaults, spot markets, HIP-3 markets, agent (API) wallets, vault signing (`vaultAddress`) and `expiresAfter`
+- trailing stops, vaults, spot markets, HIP-3 markets, vault signing (`vaultAddress`), `expiresAfter`, and user-signed transfers (`usdSend`, `withdraw3`)
 - staking and validator set changes; the set is fixed at genesis
 - a single validator rejoining a chain that kept running without it
 - deployment across machines (supported by the flags, but only tested on one machine)

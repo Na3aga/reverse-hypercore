@@ -15,7 +15,16 @@
 //!    `{name: "Exchange", version: "1", chainId: 1337, verifyingContract: 0x0}`.
 //!
 //! So a wallet shows a typed-data request, and a Hyperliquid client library
-//! pointed at this node signs valid transactions. The signer's address is
+//! pointed at this node signs valid transactions.
+//!
+//! `approveAgent` is a *user-signed* action instead (Hyperliquid's second
+//! scheme): its own fields are the EIP-712 message
+//! `HyperliquidTransaction:ApproveAgent(string hyperliquidChain, address
+//! agentAddress, string agentName, uint64 nonce)` in the domain
+//! `{name: "HyperliquidSignTransaction", version: "1", chainId:
+//! signatureChainId, verifyingContract: 0x0}`. Its chain id is whatever chain
+//! the user's wallet is on, so a wallet like MetaMask can sign it; the
+//! approved agent key then signs L1 actions for the user. The signer's address is
 //! `keccak256(pubkey)[12..]`, the same address that key has on the EVM side,
 //! so one key controls both the core account and the EVM account.
 
@@ -236,6 +245,17 @@ actions! {
     EvmUserModify {
         using_big_blocks: bool,
     },
+    /// Lets `agent_address` sign L1 actions for the signer (an API wallet).
+    /// User-signed: see the module docs. `nonce` must equal the transaction's.
+    /// Approving another agent under the same name replaces the old one.
+    ApproveAgent {
+        signature_chain_id: String,
+        hyperliquid_chain: String,
+        agent_address: Address,
+        #[serde(default)]
+        agent_name: String,
+        nonce: u64,
+    },
     /// Devnet faucet: credits the signer with USDC (bounded by genesis params).
     Faucet {
         usd: String,
@@ -414,6 +434,51 @@ fn domain_separator() -> [u8; 32] {
     })
 }
 
+/// `hyperliquidChain` of this network for user-signed actions.
+pub const HYPERLIQUID_CHAIN: &str = "Testnet";
+
+fn eip712_digest(domain_separator: &[u8; 32], struct_hash: &[u8; 32]) -> [u8; 32] {
+    let mut msg = Vec::with_capacity(66);
+    msg.extend_from_slice(&[0x19, 0x01]);
+    msg.extend_from_slice(domain_separator);
+    msg.extend_from_slice(struct_hash);
+    keccak256(&msg)
+}
+
+fn word_u64(v: u64) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[24..].copy_from_slice(&v.to_be_bytes());
+    w
+}
+
+/// The EIP-712 digest of a user-signed action, or `None` for L1 actions.
+/// An unparsable `signatureChainId` gives a digest no key signed.
+pub fn user_signed_hash(action: &Action) -> Option<[u8; 32]> {
+    let Action::ApproveAgent { signature_chain_id, hyperliquid_chain, agent_address, agent_name, nonce } = action else { return None };
+    let chain_id = u64::from_str_radix(signature_chain_id.trim_start_matches("0x"), 16).unwrap_or(u64::MAX);
+    let mut d = Vec::with_capacity(160);
+    d.extend_from_slice(&keccak256(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"));
+    d.extend_from_slice(&keccak256(b"HyperliquidSignTransaction"));
+    d.extend_from_slice(&keccak256(b"1"));
+    d.extend_from_slice(&word_u64(chain_id));
+    d.extend_from_slice(&[0u8; 32]);
+    let mut s = Vec::with_capacity(160);
+    s.extend_from_slice(&keccak256(b"HyperliquidTransaction:ApproveAgent(string hyperliquidChain,address agentAddress,string agentName,uint64 nonce)"));
+    s.extend_from_slice(&keccak256(hyperliquid_chain.as_bytes()));
+    let mut a = [0u8; 32];
+    a[12..].copy_from_slice(&agent_address.0);
+    s.extend_from_slice(&a);
+    s.extend_from_slice(&keccak256(agent_name.as_bytes()));
+    s.extend_from_slice(&word_u64(*nonce));
+    Some(eip712_digest(&keccak256(&d), &keccak256(&s)))
+}
+
+/// What a transaction's signature covers: the user-signed digest for
+/// user-signed actions, else the L1 action digest.
+pub fn tx_digest(action: &Action, nonce: u64) -> [u8; 32] {
+    user_signed_hash(action).unwrap_or_else(|| signing_hash(action, nonce))
+}
+
 /// The digest the signer signs: EIP-712 typed data of the phantom agent
 /// `Agent{source, connectionId: action_hash}`.
 pub fn signing_hash(action: &Action, nonce: u64) -> [u8; 32] {
@@ -421,16 +486,12 @@ pub fn signing_hash(action: &Action, nonce: u64) -> [u8; 32] {
     agent.extend_from_slice(&keccak256(b"Agent(string source,bytes32 connectionId)"));
     agent.extend_from_slice(&keccak256(AGENT_SOURCE.as_bytes()));
     agent.extend_from_slice(&action_hash(action, nonce));
-    let mut msg = Vec::with_capacity(66);
-    msg.extend_from_slice(&[0x19, 0x01]);
-    msg.extend_from_slice(&domain_separator());
-    msg.extend_from_slice(&keccak256(&agent));
-    keccak256(&msg)
+    eip712_digest(&domain_separator(), &keccak256(&agent))
 }
 
 impl SignedTx {
     pub fn sign(key: &SigningKey, action: Action, nonce: u64) -> SignedTx {
-        let msg = signing_hash(&action, nonce);
+        let msg = tx_digest(&action, nonce);
         let (sig, rid) = key.sign_prehash_recoverable(&msg).expect("signing succeeds");
         let mut bytes = [0u8; 65];
         bytes[..64].copy_from_slice(&sig.to_bytes());
@@ -452,7 +513,7 @@ impl SignedTx {
             return None;
         }
         let sig = RecoverableSignature::from_compact(&bytes[..64], rid).ok()?;
-        let msg = secp256k1::Message::from_digest(signing_hash(&self.action, self.nonce));
+        let msg = secp256k1::Message::from_digest(tx_digest(&self.action, self.nonce));
         let pk = secp256k1::SECP256K1.recover_ecdsa(&msg, &sig).ok()?;
         let h = keccak256(&pk.serialize_uncompressed()[1..]);
         let mut a = [0u8; 20];
@@ -464,7 +525,7 @@ impl SignedTx {
     pub fn signer_k256(&self) -> Option<Address> {
         let sig = Signature::from_slice(&self.signature.0[..64]).ok()?;
         let rid = RecoveryId::from_byte(self.signature.0[64].checked_sub(27)?)?;
-        let vk = VerifyingKey::recover_from_prehash(&signing_hash(&self.action, self.nonce), &sig, rid).ok()?;
+        let vk = VerifyingKey::recover_from_prehash(&tx_digest(&self.action, self.nonce), &sig, rid).ok()?;
         Some(address_of(&vk))
     }
 

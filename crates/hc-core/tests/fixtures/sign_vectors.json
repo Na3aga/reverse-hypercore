@@ -171,5 +171,17 @@
     },
     "nonce": 1760000000009,
     "signature": "0xe16acf72caa6466883829f17a0342623a0ef4be95064bfccb8d2410c10b6b9201077319d38582318e1d53237372f267f7e740d522fc357f45d8bed8b8b3d9b391c"
+  },
+  {
+    "action": {
+      "type": "approveAgent",
+      "signatureChainId": "0x66eee",
+      "hyperliquidChain": "Testnet",
+      "agentAddress": "0x5823147efd506c673db8b0502c883487da2e75e8",
+      "agentName": "web",
+      "nonce": 1760000000010
+    },
+    "nonce": 1760000000010,
+    "signature": "0xfd521e9cd647b762badeab0c559bcee66a57d8555aa7cb1311377ffea676d90837a705e15174df7afaad9a8cf8df59eebf17f09c863947797a3d7ee3cb2af9551b"
   }
 ]

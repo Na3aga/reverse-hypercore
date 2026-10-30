@@ -136,6 +136,9 @@ pub fn info(shared: &Shared, req: &Value) -> Result<Value, String> {
                 "core": views::clearinghouse_state(&st, user),
                 "openOrders": views::open_orders(&st, user),
                 "twaps": views::twaps(&st, user),
+                // Agents (API wallets) this account approved, and the account this address signs for if it is an agent.
+                "agents": st.agents.iter().filter(|(_, a)| a.owner == user).map(|(addr, a)| json!({"address": addr, "name": a.name})).collect::<Vec<_>>(),
+                "agentOf": st.agents.get(&user).map(|a| a.owner),
                 "risk": views::risk(&st, user),
                 "evm": {"balanceWei": evm_balance, "nonce": st.evm.nonce(user.0), "isContract": !st.evm.code(user.0).is_empty(), "usingBigBlocks": st.big_block_users.contains(&user)},
                 "activity": activity,

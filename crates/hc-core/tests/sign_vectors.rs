@@ -31,6 +31,13 @@ fn vectors() -> Vec<SignedTx> {
         Action::UpdateIsolatedMargin { asset: 0, is_buy: true, ntli: -2_500_000_000 },
         Action::TwapOrder { twap: hc_core::twap::TwapWire { a: 1, b: false, s: "12.5".into(), r: false, m: 30, t: true } },
         Action::TwapCancel { a: 1, t: 7 },
+        Action::ApproveAgent {
+            signature_chain_id: "0x66eee".into(),
+            hyperliquid_chain: hc_core::action::HYPERLIQUID_CHAIN.into(),
+            agent_address: hc_core::action::key_address(&dev_key("alice-agent")),
+            agent_name: "web".into(),
+            nonce: 1_760_000_000_010,
+        },
     ];
     actions.into_iter().enumerate().map(|(i, a)| SignedTx::sign(&k, a, 1_760_000_000_000 + i as u64)).collect()
 }

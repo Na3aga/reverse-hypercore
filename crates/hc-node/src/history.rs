@@ -137,6 +137,7 @@ pub fn action_type(a: &Action) -> &'static str {
         Action::TwapOrder { .. } => "twapOrder",
         Action::TwapCancel { .. } => "twapCancel",
         Action::EvmUserModify { .. } => "evmUserModify",
+        Action::ApproveAgent { .. } => "approveAgent",
         Action::Faucet { .. } => "faucet",
         Action::SendToEvm { .. } => "sendToEvm",
         Action::SetOracle { .. } => "setOracle",

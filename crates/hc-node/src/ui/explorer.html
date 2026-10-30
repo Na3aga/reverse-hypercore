@@ -156,6 +156,7 @@ function actionSummary(a) {
     case 'twapOrder': return `TWAP ${sideTxt(a.twap.b)} ${a.twap.s} ${coinOf(a.twap.a)} over ${a.twap.m} min${a.twap.r ? ' · reduce-only' : ''}${a.twap.t ? ' · randomized' : ''}`;
     case 'twapCancel': return `Cancel TWAP #${a.t} on ${coinOf(a.a)}`;
     case 'evmUserModify': return `Send EVM transactions to ${a.usingBigBlocks ? 'big blocks (1/min, 30M gas)' : 'small blocks (1/s, 2M gas)'}`;
+    case 'approveAgent': return `Approve agent ${addr(a.agentAddress)}${a.agentName ? ` "${esc(a.agentName)}"` : ''} to trade for this account (user-signed, chain ${parseInt(a.signatureChainId)})`;
     case 'faucet': return `Faucet ${a.usd} USDC`;
     case 'sendToEvm': return `Bridge ${a.usd} USDC to HyperEVM`;
     case 'setOracle': return `Oracle vote: ${a.pxs.map((p, i) => `${coinOf(i)} ${p}`).join(', ')}`;
