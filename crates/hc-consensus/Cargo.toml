@@ -1,0 +1,23 @@
+[package]
+name = "hc-consensus"
+description = "Application-agnostic BFT consensus (Commonware simplex) over opaque block payloads."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+commonware-actor.workspace = true
+commonware-consensus.workspace = true
+commonware-cryptography.workspace = true
+commonware-macros.workspace = true
+commonware-p2p.workspace = true
+commonware-parallel.workspace = true
+commonware-runtime.workspace = true
+commonware-utils.workspace = true
+rand_core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
